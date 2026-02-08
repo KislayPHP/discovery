@@ -1,6 +1,22 @@
 # KislayPHP Discovery
 
-Service discovery extension for KislayPHP.
+KislayPHP Discovery is a lightweight in-memory service registry with optional EventBus integration.
+
+## Key Features
+
+- Register, deregister, resolve, and list services.
+- Optional EventBus emit on service register/deregister.
+- Simple API for local or dev service discovery.
+
+## Use Cases
+
+- Local service catalogs during development.
+- Lightweight service registry for demos and tests.
+- Pair with the gateway for simple routing.
+
+## SEO Keywords
+
+PHP service discovery, service registry, microservices, C++ PHP extension, event bus integration
 
 ## Repository
 
