@@ -1,6 +1,19 @@
-# kislayphp_discovery
+# KislayPHP Discovery
 
 Service discovery extension for KislayPHP.
+
+## Repository
+
+- https://github.com/KislayPHP/discovery
+
+## Related Modules
+
+- https://github.com/KislayPHP/core
+- https://github.com/KislayPHP/eventbus
+- https://github.com/KislayPHP/gateway
+- https://github.com/KislayPHP/config
+- https://github.com/KislayPHP/metrics
+- https://github.com/KislayPHP/queue
 
 ## Build
 
@@ -13,8 +26,8 @@ make
 ## Run Locally
 
 ```sh
-cd /path/to/phpExtension/kislayphp_discovery
-php -d extension=modules/kislayphp_discovery.so -d extension=../kislay_socket/modules/kislay_socket.so example.php
+cd /path/to/discovery
+php -d extension=modules/kislayphp_discovery.so -d extension=/path/to/eventbus/modules/kislay_socket.so example.php
 ```
 
 ## Example
