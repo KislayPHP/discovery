@@ -1,22 +1,71 @@
 extern "C" {
 #include "php.h"
 #include "ext/standard/info.h"
+#include "Zend/zend_API.h"
 #include "Zend/zend_exceptions.h"
 #include "Zend/zend_interfaces.h"
 }
 
 #include "php_kislayphp_discovery.h"
 
+#include <cstring>
 #include <string>
 #include <unordered_map>
 
+#ifndef zend_call_method_with_0_params
+static inline void kislayphp_call_method_with_0_params(
+    zend_object *obj,
+    zend_class_entry *obj_ce,
+    zend_function **fn_proxy,
+    const char *function_name,
+    zval *retval) {
+    zend_call_method(obj, obj_ce, fn_proxy, function_name, std::strlen(function_name), retval, 0, nullptr, nullptr);
+}
+
+#define zend_call_method_with_0_params(obj, obj_ce, fn_proxy, function_name, retval) \
+    kislayphp_call_method_with_0_params(obj, obj_ce, fn_proxy, function_name, retval)
+#endif
+
+#ifndef zend_call_method_with_1_params
+static inline void kislayphp_call_method_with_1_params(
+    zend_object *obj,
+    zend_class_entry *obj_ce,
+    zend_function **fn_proxy,
+    const char *function_name,
+    zval *retval,
+    zval *param1) {
+    zend_call_method(obj, obj_ce, fn_proxy, function_name, std::strlen(function_name), retval, 1, param1, nullptr);
+}
+
+#define zend_call_method_with_1_params(obj, obj_ce, fn_proxy, function_name, retval, param1) \
+    kislayphp_call_method_with_1_params(obj, obj_ce, fn_proxy, function_name, retval, param1)
+#endif
+
+#ifndef zend_call_method_with_2_params
+static inline void kislayphp_call_method_with_2_params(
+    zend_object *obj,
+    zend_class_entry *obj_ce,
+    zend_function **fn_proxy,
+    const char *function_name,
+    zval *retval,
+    zval *param1,
+    zval *param2) {
+    zend_call_method(obj, obj_ce, fn_proxy, function_name, std::strlen(function_name), retval, 2, param1, param2);
+}
+
+#define zend_call_method_with_2_params(obj, obj_ce, fn_proxy, function_name, retval, param1, param2) \
+    kislayphp_call_method_with_2_params(obj, obj_ce, fn_proxy, function_name, retval, param1, param2)
+#endif
 static zend_class_entry *kislayphp_discovery_ce;
+static zend_class_entry *kislayphp_discovery_client_ce;
 
 typedef struct _php_kislayphp_discovery_t {
     zend_object std;
     std::unordered_map<std::string, std::string> services;
     zval bus;
     bool has_bus;
+    zval client;
+    bool has_client;
 } php_kislayphp_discovery_t;
 
 static zend_object_handlers kislayphp_discovery_handlers;
@@ -34,6 +83,8 @@ static zend_object *kislayphp_discovery_create_object(zend_class_entry *ce) {
     new (&obj->services) std::unordered_map<std::string, std::string>();
     ZVAL_UNDEF(&obj->bus);
     obj->has_bus = false;
+    ZVAL_UNDEF(&obj->client);
+    obj->has_client = false;
     obj->std.handlers = &kislayphp_discovery_handlers;
     return &obj->std;
 }
@@ -42,6 +93,9 @@ static void kislayphp_discovery_free_obj(zend_object *object) {
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(object);
     if (obj->has_bus) {
         zval_ptr_dtor(&obj->bus);
+    }
+    if (obj->has_client) {
+        zval_ptr_dtor(&obj->client);
     }
     obj->services.~unordered_map();
     zend_object_std_dtor(&obj->std);
@@ -97,8 +151,38 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_set_bus, 0, 0, 1)
     ZEND_ARG_OBJ_INFO(0, bus, stdClass, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_set_client, 0, 0, 1)
+    ZEND_ARG_OBJ_INFO(0, client, KislayPHP\\Discovery\\ClientInterface, 0)
+ZEND_END_ARG_INFO()
+
 PHP_METHOD(KislayPHPDiscovery, __construct) {
     ZEND_PARSE_PARAMETERS_NONE();
+}
+
+PHP_METHOD(KislayPHPDiscovery, setClient) {
+    zval *client = nullptr;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ZVAL(client)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (client == nullptr || Z_TYPE_P(client) != IS_OBJECT) {
+        zend_throw_exception(zend_ce_exception, "Client must be an object", 0);
+        RETURN_FALSE;
+    }
+
+    if (!instanceof_function(Z_OBJCE_P(client), kislayphp_discovery_client_ce)) {
+        zend_throw_exception(zend_ce_exception, "Client must implement KislayPHP\\Discovery\\ClientInterface", 0);
+        RETURN_FALSE;
+    }
+
+    php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client) {
+        zval_ptr_dtor(&obj->client);
+        obj->has_client = false;
+    }
+    ZVAL_COPY(&obj->client, client);
+    obj->has_client = true;
+    RETURN_TRUE;
 }
 
 PHP_METHOD(KislayPHPDiscovery, register) {
@@ -112,6 +196,30 @@ PHP_METHOD(KislayPHPDiscovery, register) {
     ZEND_PARSE_PARAMETERS_END();
 
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client) {
+        zval name_zv;
+        zval url_zv;
+        ZVAL_STRINGL(&name_zv, name, name_len);
+        ZVAL_STRINGL(&url_zv, url, url_len);
+
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_method_with_2_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "register", &retval, &name_zv, &url_zv);
+
+        zval_ptr_dtor(&name_zv);
+        zval_ptr_dtor(&url_zv);
+
+        if (!Z_ISUNDEF(retval) && Z_TYPE(retval) == IS_FALSE) {
+            zval_ptr_dtor(&retval);
+            RETURN_FALSE;
+        }
+        if (!Z_ISUNDEF(retval)) {
+            zval_ptr_dtor(&retval);
+        }
+        kislayphp_discovery_emit(obj, "discovery.register", std::string(name, name_len), std::string(url, url_len));
+        RETURN_TRUE;
+    }
+
     obj->services[std::string(name, name_len)] = std::string(url, url_len);
     kislayphp_discovery_emit(obj, "discovery.register", std::string(name, name_len), std::string(url, url_len));
     RETURN_TRUE;
@@ -127,6 +235,40 @@ PHP_METHOD(KislayPHPDiscovery, deregister) {
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
     std::string key(name, name_len);
     std::string url;
+
+    if (obj->has_client) {
+        zval name_zv;
+        ZVAL_STRINGL(&name_zv, name, name_len);
+
+        zval resolve_ret;
+        ZVAL_UNDEF(&resolve_ret);
+        zend_call_method_with_1_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "resolve", &resolve_ret, &name_zv);
+        if (Z_TYPE(resolve_ret) == IS_STRING) {
+            url.assign(Z_STRVAL(resolve_ret), Z_STRLEN(resolve_ret));
+        }
+        if (!Z_ISUNDEF(resolve_ret)) {
+            zval_ptr_dtor(&resolve_ret);
+        }
+
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_method_with_1_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "deregister", &retval, &name_zv);
+        zval_ptr_dtor(&name_zv);
+
+        if (!Z_ISUNDEF(retval) && Z_TYPE(retval) == IS_FALSE) {
+            zval_ptr_dtor(&retval);
+            RETURN_FALSE;
+        }
+        if (!Z_ISUNDEF(retval)) {
+            zval_ptr_dtor(&retval);
+        }
+
+        if (!url.empty()) {
+            kislayphp_discovery_emit(obj, "discovery.deregister", key, url);
+        }
+        RETURN_TRUE;
+    }
+
     auto it = obj->services.find(key);
     if (it != obj->services.end()) {
         url = it->second;
@@ -140,6 +282,19 @@ PHP_METHOD(KislayPHPDiscovery, deregister) {
 
 PHP_METHOD(KislayPHPDiscovery, list) {
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client) {
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_method_with_0_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "list", &retval);
+
+        if (Z_ISUNDEF(retval)) {
+            array_init(return_value);
+            return;
+        }
+        RETVAL_ZVAL(&retval, 1, 1);
+        return;
+    }
+
     array_init(return_value);
     for (const auto &entry : obj->services) {
         add_assoc_string(return_value, entry.first.c_str(), entry.second.c_str());
@@ -154,6 +309,22 @@ PHP_METHOD(KislayPHPDiscovery, resolve) {
     ZEND_PARSE_PARAMETERS_END();
 
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client) {
+        zval name_zv;
+        ZVAL_STRINGL(&name_zv, name, name_len);
+
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_method_with_1_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "resolve", &retval, &name_zv);
+        zval_ptr_dtor(&name_zv);
+
+        if (Z_ISUNDEF(retval)) {
+            RETURN_NULL();
+        }
+        RETVAL_ZVAL(&retval, 1, 1);
+        return;
+    }
+
     auto it = obj->services.find(std::string(name, name_len));
     if (it == obj->services.end()) {
         RETURN_NULL();
@@ -189,11 +360,22 @@ static const zend_function_entry kislayphp_discovery_methods[] = {
     PHP_ME(KislayPHPDiscovery, list, arginfo_kislayphp_discovery_void, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPDiscovery, resolve, arginfo_kislayphp_discovery_resolve, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPDiscovery, setBus, arginfo_kislayphp_discovery_set_bus, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPDiscovery, setClient, arginfo_kislayphp_discovery_set_client, ZEND_ACC_PUBLIC)
+    PHP_FE_END
+};
+
+static const zend_function_entry kislayphp_discovery_client_methods[] = {
+    ZEND_ABSTRACT_ME(KislayPHPDiscoveryClientInterface, register, arginfo_kislayphp_discovery_register)
+    ZEND_ABSTRACT_ME(KislayPHPDiscoveryClientInterface, deregister, arginfo_kislayphp_discovery_deregister)
+    ZEND_ABSTRACT_ME(KislayPHPDiscoveryClientInterface, resolve, arginfo_kislayphp_discovery_resolve)
+    ZEND_ABSTRACT_ME(KislayPHPDiscoveryClientInterface, list, arginfo_kislayphp_discovery_void)
     PHP_FE_END
 };
 
 PHP_MINIT_FUNCTION(kislayphp_discovery) {
     zend_class_entry ce;
+    INIT_NS_CLASS_ENTRY(ce, "KislayPHP\\Discovery", "ClientInterface", kislayphp_discovery_client_methods);
+    kislayphp_discovery_client_ce = zend_register_internal_interface(&ce);
     INIT_NS_CLASS_ENTRY(ce, "KislayPHP\\Discovery", "ServiceRegistry", kislayphp_discovery_methods);
     kislayphp_discovery_ce = zend_register_internal_class(&ce);
     kislayphp_discovery_ce->create_object = kislayphp_discovery_create_object;
