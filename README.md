@@ -1,10 +1,11 @@
 # KislayPHP Discovery
 
-KislayPHP Discovery is a lightweight in-memory service registry with optional EventBus integration.
+KislayPHP Discovery is a lightweight service registry for PHP microservices with optional EventBus integration.
 
 ## Key Features
 
 - Register, deregister, resolve, and list services.
+- Supports in-memory or custom client storage.
 - Optional EventBus emit on service register/deregister.
 - Simple API for local or dev service discovery.
 
@@ -16,7 +17,7 @@ KislayPHP Discovery is a lightweight in-memory service registry with optional Ev
 
 ## SEO Keywords
 
-PHP service discovery, service registry, microservices, C++ PHP extension, event bus integration
+PHP service discovery, service registry, service catalog, microservices, C++ PHP extension, event bus integration
 
 ## Repository
 
@@ -44,6 +45,19 @@ make
 ```sh
 cd /path/to/discovery
 php -d extension=modules/kislayphp_discovery.so -d extension=/path/to/eventbus/modules/kislay_socket.so example.php
+```
+
+## Custom Client Interface
+
+Default is in-memory. To plug in Redis, MySQL, Mongo, or any other backend, provide
+your own PHP client that implements `KislayPHP\Discovery\ClientInterface` and call
+`setClient()`.
+
+Example:
+
+```php
+$registry = new KislayPHP\Discovery\ServiceRegistry();
+$registry->setClient(new MyDiscoveryClient());
 ```
 
 ## Example
