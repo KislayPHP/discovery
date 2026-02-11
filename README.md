@@ -32,7 +32,21 @@ PHP service discovery, service registry, service catalog, microservices, C++ PHP
 - https://github.com/KislayPHP/metrics
 - https://github.com/KislayPHP/queue
 
-## Build
+## Installation
+
+### Via PECL
+
+```bash
+pecl install kislayphp_discovery
+```
+
+Then add to your php.ini:
+
+```ini
+extension=kislayphp_discovery.so
+```
+
+### Manual Build
 
 ```sh
 phpize

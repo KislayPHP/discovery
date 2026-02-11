@@ -9,6 +9,7 @@ extern "C" {
 #include "php_kislayphp_discovery.h"
 
 #include <cstring>
+#include <pthread.h>
 #include <string>
 #include <unordered_map>
 
@@ -60,12 +61,13 @@ static zend_class_entry *kislayphp_discovery_ce;
 static zend_class_entry *kislayphp_discovery_client_ce;
 
 typedef struct _php_kislayphp_discovery_t {
-    zend_object std;
     std::unordered_map<std::string, std::string> services;
+    pthread_mutex_t lock;
     zval bus;
     bool has_bus;
     zval client;
     bool has_client;
+    zend_object std;
 } php_kislayphp_discovery_t;
 
 static zend_object_handlers kislayphp_discovery_handlers;
@@ -81,6 +83,7 @@ static zend_object *kislayphp_discovery_create_object(zend_class_entry *ce) {
     zend_object_std_init(&obj->std, ce);
     object_properties_init(&obj->std, ce);
     new (&obj->services) std::unordered_map<std::string, std::string>();
+    pthread_mutex_init(&obj->lock, nullptr);
     ZVAL_UNDEF(&obj->bus);
     obj->has_bus = false;
     ZVAL_UNDEF(&obj->client);
@@ -98,6 +101,7 @@ static void kislayphp_discovery_free_obj(zend_object *object) {
         zval_ptr_dtor(&obj->client);
     }
     obj->services.~unordered_map();
+    pthread_mutex_destroy(&obj->lock);
     zend_object_std_dtor(&obj->std);
 }
 
@@ -220,7 +224,9 @@ PHP_METHOD(KislayPHPDiscovery, register) {
         RETURN_TRUE;
     }
 
+    pthread_mutex_lock(&obj->lock);
     obj->services[std::string(name, name_len)] = std::string(url, url_len);
+    pthread_mutex_unlock(&obj->lock);
     kislayphp_discovery_emit(obj, "discovery.register", std::string(name, name_len), std::string(url, url_len));
     RETURN_TRUE;
 }
@@ -269,11 +275,13 @@ PHP_METHOD(KislayPHPDiscovery, deregister) {
         RETURN_TRUE;
     }
 
+    pthread_mutex_lock(&obj->lock);
     auto it = obj->services.find(key);
     if (it != obj->services.end()) {
         url = it->second;
         obj->services.erase(it);
     }
+    pthread_mutex_unlock(&obj->lock);
     if (!url.empty()) {
         kislayphp_discovery_emit(obj, "discovery.deregister", key, url);
     }
@@ -296,9 +304,11 @@ PHP_METHOD(KislayPHPDiscovery, list) {
     }
 
     array_init(return_value);
+    pthread_mutex_lock(&obj->lock);
     for (const auto &entry : obj->services) {
         add_assoc_string(return_value, entry.first.c_str(), entry.second.c_str());
     }
+    pthread_mutex_unlock(&obj->lock);
 }
 
 PHP_METHOD(KislayPHPDiscovery, resolve) {
@@ -325,11 +335,19 @@ PHP_METHOD(KislayPHPDiscovery, resolve) {
         return;
     }
 
+    std::string value;
+    bool found = false;
+    pthread_mutex_lock(&obj->lock);
     auto it = obj->services.find(std::string(name, name_len));
-    if (it == obj->services.end()) {
+    if (it != obj->services.end()) {
+        value = it->second;
+        found = true;
+    }
+    pthread_mutex_unlock(&obj->lock);
+    if (!found) {
         RETURN_NULL();
     }
-    RETURN_STRING(it->second.c_str());
+    RETURN_STRING(value.c_str());
 }
 
 PHP_METHOD(KislayPHPDiscovery, setBus) {
