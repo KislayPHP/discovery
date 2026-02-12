@@ -5,7 +5,7 @@
 [![Build Status](https://img.shields.io/github/actions/workflow/status/KislayPHP/discovery/ci.yml)](https://github.com/KislayPHP/discovery/actions)
 [![codecov](https://codecov.io/gh/KislayPHP/discovery/branch/main/graph/badge.svg)](https://codecov.io/gh/KislayPHP/discovery)
 
-A high-performance C++ PHP extension providing service discovery and registration for microservices with support for Consul, etcd, and custom backends.
+A high-performance C++ PHP extension providing service discovery and registration for microservices with support for Consul, etcd, and custom backends. Perfect for PHP echo system integration and modern microservices architecture.
 
 ## ⚡ Key Features
 
@@ -16,6 +16,8 @@ A high-performance C++ PHP extension providing service discovery and registratio
 - 🔄 **Auto-Registration**: Automatic service registration with metadata
 - 📊 **Metrics**: Service discovery statistics and monitoring
 - 🌐 **Multi-Datacenter**: Cross-datacenter service discovery support
+- 🔄 **PHP Echo System**: Seamless integration with PHP ecosystem and frameworks
+- 🌐 **Microservices Architecture**: Designed for distributed PHP applications
 
 ## 📦 Installation
 
@@ -315,3 +317,9 @@ var_dump($registry->resolve('user-service'));
 print_r($registry->list());
 ?>
 ```
+
+## SEO Keywords
+
+PHP, microservices, PHP echo system, PHP extension, C++ PHP extension, PHP service discovery, PHP service registry, PHP Consul, PHP etcd, PHP ZooKeeper, PHP health checks, PHP microservices discovery, distributed PHP services
+
+---
