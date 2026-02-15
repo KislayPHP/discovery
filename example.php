@@ -2,8 +2,14 @@
 // Run from this folder with:
 // php -d extension=modules/kislayphp_discovery.so -d extension=../kislay_socket/modules/kislay_socket.so example.php
 
-extension_loaded('kislayphp_discovery') or die('kislayphp_discovery not loaded');
-extension_loaded('kislayphp_eventbus') or die('kislayphp_eventbus not loaded');
+function fail(string $message): void {
+	echo "FAIL: {$message}\n";
+	exit(1);
+}
+
+if (!extension_loaded('kislayphp_discovery')) {
+	fail('kislayphp_discovery not loaded');
+}
 
 $registry = new KislayPHP\Discovery\ServiceRegistry();
 
@@ -29,14 +35,32 @@ class ArrayDiscoveryClient implements KislayPHP\Discovery\ClientInterface {
 	}
 }
 
-$use_client = false;
-if ($use_client) {
-	$registry->setClient(new ArrayDiscoveryClient());
+$registry->setClient(new ArrayDiscoveryClient());
+if (class_exists('KislayPHP\\EventBus\\Server')) {
+	$bus = new KislayPHP\EventBus\Server();
+	$registry->setBus($bus);
 }
-$bus = new KislayPHP\EventBus\Server();
-$registry->setBus($bus);
-$registry->register('user-service', 'http://127.0.0.1:9001');
-$registry->register('order-service', 'http://127.0.0.1:9002');
 
-var_dump($registry->resolve('user-service'));
-print_r($registry->list());
+$registry->register('user-service', 'http://127.0.0.1:9001', ['zone' => 'az-1'], 'user-1');
+$registry->register('user-service', 'http://127.0.0.1:9003', ['zone' => 'az-2'], 'user-2');
+$registry->register('order-service', 'http://127.0.0.1:9002', ['zone' => 'az-1'], 'order-1');
+
+$resolved = $registry->resolve('user-service');
+if (!in_array($resolved, ['http://127.0.0.1:9001', 'http://127.0.0.1:9003'], true)) {
+	fail('resolve returned unexpected value');
+}
+
+$instances = $registry->listInstances('user-service');
+if (!is_array($instances) || count($instances) !== 2) {
+	fail('listInstances did not return expected instances');
+}
+
+$registry->setStatus('user-service', 'DOWN', 'user-1');
+$registry->heartbeat('user-service', 'user-2');
+
+$all = $registry->list();
+if (!is_array($all) || count($all) < 2) {
+	fail('list did not return expected services');
+}
+
+echo "OK: discovery example passed\n";

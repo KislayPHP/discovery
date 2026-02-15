@@ -19,6 +19,31 @@ A high-performance C++ PHP extension providing service discovery and registratio
 - 🔄 **PHP Echo System**: Seamless integration with PHP ecosystem and frameworks
 - 🌐 **Microservices Architecture**: Designed for distributed PHP applications
 
+### Spring Cloud-style Discovery Features
+
+`ServiceRegistry` now supports instance-level registration similar to Spring service discovery patterns:
+
+- Multiple instances per service (`instanceId`)
+- Instance metadata (zone/version/labels)
+- Instance status control (`UP`, `DOWN`, `OUT_OF_SERVICE`, `UNKNOWN`)
+- Heartbeat refresh API for liveness
+- Healthy instance resolution with round-robin selection
+
+Example:
+
+```php
+$registry = new KislayPHP\Discovery\ServiceRegistry();
+
+$registry->register('user-service', 'http://127.0.0.1:9001', ['zone' => 'az-1'], 'user-1');
+$registry->register('user-service', 'http://127.0.0.1:9002', ['zone' => 'az-2'], 'user-2');
+
+$registry->setStatus('user-service', 'DOWN', 'user-1');
+$registry->heartbeat('user-service', 'user-2');
+
+$url = $registry->resolve('user-service'); // resolves healthy instance
+$instances = $registry->listInstances('user-service');
+```
+
 ## 📦 Installation
 
 ### Via PECL (Recommended)

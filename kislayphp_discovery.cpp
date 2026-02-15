@@ -10,8 +10,10 @@ extern "C" {
 
 #include <cstring>
 #include <pthread.h>
+#include <chrono>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #ifndef zend_call_method_with_0_params
 static inline void kislayphp_call_method_with_0_params(
@@ -61,7 +63,18 @@ static zend_class_entry *kislayphp_discovery_ce;
 static zend_class_entry *kislayphp_discovery_client_ce;
 
 typedef struct _php_kislayphp_discovery_t {
+    struct ServiceInstance {
+        std::string service_name;
+        std::string instance_id;
+        std::string url;
+        std::string status;
+        std::unordered_map<std::string, std::string> metadata;
+        long long last_heartbeat_ms;
+    };
+
     std::unordered_map<std::string, std::string> services;
+    std::unordered_map<std::string, std::unordered_map<std::string, ServiceInstance>> instances;
+    std::unordered_map<std::string, size_t> rr_index;
     pthread_mutex_t lock;
     zval bus;
     bool has_bus;
@@ -83,6 +96,8 @@ static zend_object *kislayphp_discovery_create_object(zend_class_entry *ce) {
     zend_object_std_init(&obj->std, ce);
     object_properties_init(&obj->std, ce);
     new (&obj->services) std::unordered_map<std::string, std::string>();
+    new (&obj->instances) std::unordered_map<std::string, std::unordered_map<std::string, php_kislayphp_discovery_t::ServiceInstance>>();
+    new (&obj->rr_index) std::unordered_map<std::string, size_t>();
     pthread_mutex_init(&obj->lock, nullptr);
     ZVAL_UNDEF(&obj->bus);
     obj->has_bus = false;
@@ -100,6 +115,8 @@ static void kislayphp_discovery_free_obj(zend_object *object) {
     if (obj->has_client) {
         zval_ptr_dtor(&obj->client);
     }
+    obj->rr_index.~unordered_map();
+    obj->instances.~unordered_map();
     obj->services.~unordered_map();
     pthread_mutex_destroy(&obj->lock);
     zend_object_std_dtor(&obj->std);
@@ -135,16 +152,97 @@ static void kislayphp_discovery_emit(php_kislayphp_discovery_t *obj,
     }
 }
 
+static long long kislayphp_now_ms() {
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+
+static std::string kislayphp_upper(std::string value) {
+    for (char &c : value) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+static bool kislayphp_is_valid_status(const std::string &status) {
+    return status == "UP" || status == "DOWN" || status == "OUT_OF_SERVICE" || status == "UNKNOWN";
+}
+
+static void kislayphp_parse_metadata_array(zval *metadata_zv, std::unordered_map<std::string, std::string> &metadata) {
+    metadata.clear();
+    if (metadata_zv == nullptr || Z_TYPE_P(metadata_zv) != IS_ARRAY) {
+        return;
+    }
+    HashTable *ht = Z_ARRVAL_P(metadata_zv);
+    zval *entry = nullptr;
+    zend_string *key = nullptr;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(ht, key, entry) {
+        if (key == nullptr || entry == nullptr) {
+            continue;
+        }
+        zend_string *val_str = zval_get_string(entry);
+        metadata[std::string(ZSTR_VAL(key), ZSTR_LEN(key))] = std::string(ZSTR_VAL(val_str), ZSTR_LEN(val_str));
+        zend_string_release(val_str);
+    } ZEND_HASH_FOREACH_END();
+}
+
+static void kislayphp_add_instance_array(zval *target, const php_kislayphp_discovery_t::ServiceInstance &instance) {
+    zval item;
+    array_init(&item);
+    add_assoc_string(&item, "service", instance.service_name.c_str());
+    add_assoc_string(&item, "instanceId", instance.instance_id.c_str());
+    add_assoc_string(&item, "url", instance.url.c_str());
+    add_assoc_string(&item, "status", instance.status.c_str());
+    add_assoc_long(&item, "lastHeartbeat", static_cast<zend_long>(instance.last_heartbeat_ms));
+
+    zval meta;
+    array_init(&meta);
+    for (const auto &entry : instance.metadata) {
+        add_assoc_string(&meta, entry.first.c_str(), entry.second.c_str());
+    }
+    add_assoc_zval(&item, "metadata", &meta);
+    add_next_index_zval(target, &item);
+}
+
+static bool kislayphp_select_healthy_instance(php_kislayphp_discovery_t *obj,
+                                              const std::string &service,
+                                              php_kislayphp_discovery_t::ServiceInstance *selected) {
+    auto service_it = obj->instances.find(service);
+    if (service_it == obj->instances.end() || service_it->second.empty()) {
+        return false;
+    }
+
+    std::vector<const php_kislayphp_discovery_t::ServiceInstance *> healthy;
+    healthy.reserve(service_it->second.size());
+    for (const auto &instance_it : service_it->second) {
+        const auto &instance = instance_it.second;
+        if (instance.status == "UP") {
+            healthy.push_back(&instance);
+        }
+    }
+    if (healthy.empty()) {
+        return false;
+    }
+
+    size_t index = obj->rr_index[service] % healthy.size();
+    obj->rr_index[service] = (index + 1) % healthy.size();
+    *selected = *healthy[index];
+    return true;
+}
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_void, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_register, 0, 0, 2)
     ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
     ZEND_ARG_TYPE_INFO(0, url, IS_STRING, 0)
+    ZEND_ARG_ARRAY_INFO(0, metadata, 1)
+    ZEND_ARG_TYPE_INFO(0, instanceId, IS_STRING, 1)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_deregister, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, instanceId, IS_STRING, 1)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_resolve, 0, 0, 1)
@@ -157,6 +255,30 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_set_client, 0, 0, 1)
     ZEND_ARG_OBJ_INFO(0, client, KislayPHP\\Discovery\\ClientInterface, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_client_register, 0, 0, 2)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, url, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_client_deregister, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_list_instances, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_heartbeat, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, instanceId, IS_STRING, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_set_status, 0, 0, 2)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, status, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, instanceId, IS_STRING, 1)
 ZEND_END_ARG_INFO()
 
 PHP_METHOD(KislayPHPDiscovery, __construct) {
@@ -194,12 +316,40 @@ PHP_METHOD(KislayPHPDiscovery, register) {
     size_t name_len = 0;
     char *url = nullptr;
     size_t url_len = 0;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
+    zval *metadata_zv = nullptr;
+    char *instance_id = nullptr;
+    size_t instance_id_len = 0;
+    ZEND_PARSE_PARAMETERS_START(2, 4)
         Z_PARAM_STRING(name, name_len)
         Z_PARAM_STRING(url, url_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_EX(metadata_zv, 1, 0)
+        Z_PARAM_STRING(instance_id, instance_id_len)
     ZEND_PARSE_PARAMETERS_END();
 
+    std::string service(name, name_len);
+    std::string service_url(url, url_len);
+    std::string instance = (instance_id != nullptr && instance_id_len > 0)
+        ? std::string(instance_id, instance_id_len)
+        : service_url;
+
+    std::unordered_map<std::string, std::string> metadata;
+    kislayphp_parse_metadata_array(metadata_zv, metadata);
+
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+
+    pthread_mutex_lock(&obj->lock);
+    php_kislayphp_discovery_t::ServiceInstance record;
+    record.service_name = service;
+    record.instance_id = instance;
+    record.url = service_url;
+    record.status = "UP";
+    record.metadata = std::move(metadata);
+    record.last_heartbeat_ms = kislayphp_now_ms();
+    obj->instances[service][instance] = std::move(record);
+    obj->services[service] = service_url;
+    pthread_mutex_unlock(&obj->lock);
+
     if (obj->has_client) {
         zval name_zv;
         zval url_zv;
@@ -220,22 +370,23 @@ PHP_METHOD(KislayPHPDiscovery, register) {
         if (!Z_ISUNDEF(retval)) {
             zval_ptr_dtor(&retval);
         }
-        kislayphp_discovery_emit(obj, "discovery.register", std::string(name, name_len), std::string(url, url_len));
+        kislayphp_discovery_emit(obj, "discovery.register", service, service_url);
         RETURN_TRUE;
     }
 
-    pthread_mutex_lock(&obj->lock);
-    obj->services[std::string(name, name_len)] = std::string(url, url_len);
-    pthread_mutex_unlock(&obj->lock);
-    kislayphp_discovery_emit(obj, "discovery.register", std::string(name, name_len), std::string(url, url_len));
+    kislayphp_discovery_emit(obj, "discovery.register", service, service_url);
     RETURN_TRUE;
 }
 
 PHP_METHOD(KislayPHPDiscovery, deregister) {
     char *name = nullptr;
     size_t name_len = 0;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
+    char *instance_id = nullptr;
+    size_t instance_id_len = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_STRING(name, name_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(instance_id, instance_id_len)
     ZEND_PARSE_PARAMETERS_END();
 
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
@@ -276,10 +427,35 @@ PHP_METHOD(KislayPHPDiscovery, deregister) {
     }
 
     pthread_mutex_lock(&obj->lock);
-    auto it = obj->services.find(key);
-    if (it != obj->services.end()) {
-        url = it->second;
-        obj->services.erase(it);
+    auto svc_it = obj->instances.find(key);
+    if (svc_it != obj->instances.end()) {
+        if (instance_id != nullptr && instance_id_len > 0) {
+            std::string instance_key(instance_id, instance_id_len);
+            auto inst_it = svc_it->second.find(instance_key);
+            if (inst_it != svc_it->second.end()) {
+                url = inst_it->second.url;
+                svc_it->second.erase(inst_it);
+            }
+        } else {
+            auto first_it = svc_it->second.begin();
+            if (first_it != svc_it->second.end()) {
+                url = first_it->second.url;
+            }
+            svc_it->second.clear();
+        }
+
+        if (svc_it->second.empty()) {
+            obj->instances.erase(svc_it);
+            obj->services.erase(key);
+        } else {
+            obj->services[key] = svc_it->second.begin()->second.url;
+        }
+    } else {
+        auto it = obj->services.find(key);
+        if (it != obj->services.end()) {
+            url = it->second;
+            obj->services.erase(it);
+        }
     }
     pthread_mutex_unlock(&obj->lock);
     if (!url.empty()) {
@@ -338,16 +514,126 @@ PHP_METHOD(KislayPHPDiscovery, resolve) {
     std::string value;
     bool found = false;
     pthread_mutex_lock(&obj->lock);
-    auto it = obj->services.find(std::string(name, name_len));
-    if (it != obj->services.end()) {
-        value = it->second;
+    std::string key(name, name_len);
+    php_kislayphp_discovery_t::ServiceInstance selected;
+    if (kislayphp_select_healthy_instance(obj, key, &selected)) {
+        value = selected.url;
         found = true;
+    } else {
+        auto it = obj->services.find(key);
+        if (it != obj->services.end()) {
+            value = it->second;
+            found = true;
+        }
     }
     pthread_mutex_unlock(&obj->lock);
     if (!found) {
         RETURN_NULL();
     }
     RETURN_STRING(value.c_str());
+}
+
+PHP_METHOD(KislayPHPDiscovery, listInstances) {
+    char *name = nullptr;
+    size_t name_len = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(name, name_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    array_init(return_value);
+
+    pthread_mutex_lock(&obj->lock);
+    auto service_it = obj->instances.find(std::string(name, name_len));
+    if (service_it != obj->instances.end()) {
+        for (const auto &instance_it : service_it->second) {
+            kislayphp_add_instance_array(return_value, instance_it.second);
+        }
+    }
+    pthread_mutex_unlock(&obj->lock);
+}
+
+PHP_METHOD(KislayPHPDiscovery, heartbeat) {
+    char *name = nullptr;
+    size_t name_len = 0;
+    char *instance_id = nullptr;
+    size_t instance_id_len = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STRING(name, name_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(instance_id, instance_id_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    bool updated = false;
+    std::string key(name, name_len);
+
+    pthread_mutex_lock(&obj->lock);
+    auto service_it = obj->instances.find(key);
+    if (service_it != obj->instances.end() && !service_it->second.empty()) {
+        if (instance_id != nullptr && instance_id_len > 0) {
+            auto inst_it = service_it->second.find(std::string(instance_id, instance_id_len));
+            if (inst_it != service_it->second.end()) {
+                inst_it->second.last_heartbeat_ms = kislayphp_now_ms();
+                inst_it->second.status = "UP";
+                updated = true;
+            }
+        } else {
+            for (auto &inst_it : service_it->second) {
+                inst_it.second.last_heartbeat_ms = kislayphp_now_ms();
+                inst_it.second.status = "UP";
+            }
+            updated = true;
+        }
+    }
+    pthread_mutex_unlock(&obj->lock);
+
+    RETURN_BOOL(updated);
+}
+
+PHP_METHOD(KislayPHPDiscovery, setStatus) {
+    char *name = nullptr;
+    size_t name_len = 0;
+    char *status = nullptr;
+    size_t status_len = 0;
+    char *instance_id = nullptr;
+    size_t instance_id_len = 0;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STRING(name, name_len)
+        Z_PARAM_STRING(status, status_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(instance_id, instance_id_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string normalized = kislayphp_upper(std::string(status, status_len));
+    if (!kislayphp_is_valid_status(normalized)) {
+        zend_throw_exception(zend_ce_exception, "Invalid status. Use UP, DOWN, OUT_OF_SERVICE, or UNKNOWN", 0);
+        RETURN_FALSE;
+    }
+
+    php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    bool updated = false;
+    std::string key(name, name_len);
+
+    pthread_mutex_lock(&obj->lock);
+    auto service_it = obj->instances.find(key);
+    if (service_it != obj->instances.end() && !service_it->second.empty()) {
+        if (instance_id != nullptr && instance_id_len > 0) {
+            auto inst_it = service_it->second.find(std::string(instance_id, instance_id_len));
+            if (inst_it != service_it->second.end()) {
+                inst_it->second.status = normalized;
+                updated = true;
+            }
+        } else {
+            for (auto &inst_it : service_it->second) {
+                inst_it.second.status = normalized;
+            }
+            updated = true;
+        }
+    }
+    pthread_mutex_unlock(&obj->lock);
+
+    RETURN_BOOL(updated);
 }
 
 PHP_METHOD(KislayPHPDiscovery, setBus) {
@@ -377,14 +663,17 @@ static const zend_function_entry kislayphp_discovery_methods[] = {
     PHP_ME(KislayPHPDiscovery, deregister, arginfo_kislayphp_discovery_deregister, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPDiscovery, list, arginfo_kislayphp_discovery_void, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPDiscovery, resolve, arginfo_kislayphp_discovery_resolve, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPDiscovery, listInstances, arginfo_kislayphp_discovery_list_instances, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPDiscovery, heartbeat, arginfo_kislayphp_discovery_heartbeat, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPDiscovery, setStatus, arginfo_kislayphp_discovery_set_status, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPDiscovery, setBus, arginfo_kislayphp_discovery_set_bus, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPDiscovery, setClient, arginfo_kislayphp_discovery_set_client, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
 static const zend_function_entry kislayphp_discovery_client_methods[] = {
-    ZEND_ABSTRACT_ME(KislayPHPDiscoveryClientInterface, register, arginfo_kislayphp_discovery_register)
-    ZEND_ABSTRACT_ME(KislayPHPDiscoveryClientInterface, deregister, arginfo_kislayphp_discovery_deregister)
+    ZEND_ABSTRACT_ME(KislayPHPDiscoveryClientInterface, register, arginfo_kislayphp_discovery_client_register)
+    ZEND_ABSTRACT_ME(KislayPHPDiscoveryClientInterface, deregister, arginfo_kislayphp_discovery_client_deregister)
     ZEND_ABSTRACT_ME(KislayPHPDiscoveryClientInterface, resolve, arginfo_kislayphp_discovery_resolve)
     ZEND_ABSTRACT_ME(KislayPHPDiscoveryClientInterface, list, arginfo_kislayphp_discovery_void)
     PHP_FE_END
