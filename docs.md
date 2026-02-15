@@ -20,9 +20,9 @@ The KislayPHP Discovery extension provides service discovery and registration ca
 
 ## Installation
 
-### Via PECL
+### Via PIE
 ```bash
-pecl install kislayphp_discovery
+pie install kislayphp/discovery
 ```
 
 ### Manual Build

@@ -46,10 +46,10 @@ $instances = $registry->listInstances('user-service');
 
 ## 📦 Installation
 
-### Via PECL (Recommended)
+### Via PIE (Recommended)
 
 ```bash
-pecl install kislayphp_discovery
+pie install kislayphp/discovery
 ```
 
 Add to your `php.ini`:
@@ -73,7 +73,6 @@ sudo make install
 
 ```dockerfile
 FROM php:8.2-cli
-RUN pecl install kislayphp_discovery && docker-php-ext-enable kislayphp_discovery
 ```
 
 ## 🚀 Quick Start
@@ -284,10 +283,10 @@ Licensed under the [Apache License 2.0](LICENSE).
 
 ## Installation
 
-### Via PECL
+### Via PIE
 
 ```bash
-pecl install kislayphp_discovery
+pie install kislayphp/discovery
 ```
 
 Then add to your php.ini:
