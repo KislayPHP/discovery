@@ -8,12 +8,21 @@ extern "C" {
 
 #include "php_kislayphp_discovery.h"
 
+#include <chrono>
 #include <cstring>
 #include <pthread.h>
+#include <cstdlib>
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#ifdef KISLAYPHP_RPC
+#include <grpcpp/grpcpp.h>
+
+#include "discovery.grpc.pb.h"
+#endif
 
 #ifndef zend_call_method_with_0_params
 static inline void kislayphp_call_method_with_0_params(
@@ -61,6 +70,324 @@ static inline void kislayphp_call_method_with_2_params(
 #endif
 static zend_class_entry *kislayphp_discovery_ce;
 static zend_class_entry *kislayphp_discovery_client_ce;
+
+static zend_long kislayphp_env_long(const char *name, zend_long fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return static_cast<zend_long>(std::strtoll(value, nullptr, 10));
+}
+
+static bool kislayphp_env_bool(const char *name, bool fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0) {
+        return true;
+    }
+    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 || std::strcmp(value, "FALSE") == 0) {
+        return false;
+    }
+    return fallback;
+}
+
+static std::string kislayphp_env_string(const char *name, const std::string &fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return std::string(value);
+}
+
+#ifdef KISLAYPHP_RPC
+static bool kislayphp_rpc_enabled() {
+    return kislayphp_env_bool("KISLAY_RPC_ENABLED", false);
+}
+
+static zend_long kislayphp_rpc_timeout_ms() {
+    zend_long timeout = kislayphp_env_long("KISLAY_RPC_TIMEOUT_MS", 200);
+    return timeout > 0 ? timeout : 200;
+}
+
+static std::string kislayphp_rpc_discovery_endpoint() {
+    return kislayphp_env_string("KISLAY_RPC_DISCOVERY_ENDPOINT", "127.0.0.1:9090");
+}
+
+static kislay::discovery::v1::DiscoveryService::Stub *kislayphp_rpc_discovery_stub(const std::string &endpoint) {
+    static std::mutex lock;
+    static std::string cached_endpoint;
+    static std::shared_ptr<grpc::Channel> channel;
+    static std::unique_ptr<kislay::discovery::v1::DiscoveryService::Stub> stub;
+    std::lock_guard<std::mutex> guard(lock);
+    if (!stub || cached_endpoint != endpoint) {
+        channel = grpc::CreateChannel(endpoint, grpc::InsecureChannelCredentials());
+        stub = kislay::discovery::v1::DiscoveryService::NewStub(channel);
+        cached_endpoint = endpoint;
+    }
+    return stub.get();
+}
+
+static bool kislayphp_rpc_discovery_register(const std::string &service,
+                                             const std::string &instance_id,
+                                             const std::string &url,
+                                             const std::unordered_map<std::string, std::string> &metadata,
+                                             std::string *error) {
+    auto *stub = kislayphp_rpc_discovery_stub(kislayphp_rpc_discovery_endpoint());
+    if (!stub) {
+        if (error) {
+            *error = "RPC stub unavailable";
+        }
+        return false;
+    }
+
+    kislay::discovery::v1::RegisterRequest request;
+    request.set_service_name(service);
+    request.set_instance_id(instance_id);
+    request.set_url(url);
+    for (const auto &entry : metadata) {
+        (*request.mutable_metadata())[entry.first] = entry.second;
+    }
+
+    kislay::discovery::v1::RegisterResponse response;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kislayphp_rpc_timeout_ms()));
+
+    grpc::Status status = stub->Register(&context, request, &response);
+    if (!status.ok()) {
+        if (error) {
+            *error = status.error_message();
+        }
+        return false;
+    }
+    if (!response.ok()) {
+        if (error) {
+            *error = response.error();
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool kislayphp_rpc_discovery_deregister(const std::string &service,
+                                               const std::string &instance_id,
+                                               std::string *error) {
+    auto *stub = kislayphp_rpc_discovery_stub(kislayphp_rpc_discovery_endpoint());
+    if (!stub) {
+        if (error) {
+            *error = "RPC stub unavailable";
+        }
+        return false;
+    }
+
+    kislay::discovery::v1::DeregisterRequest request;
+    request.set_service_name(service);
+    request.set_instance_id(instance_id);
+
+    kislay::discovery::v1::DeregisterResponse response;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kislayphp_rpc_timeout_ms()));
+
+    grpc::Status status = stub->Deregister(&context, request, &response);
+    if (!status.ok()) {
+        if (error) {
+            *error = status.error_message();
+        }
+        return false;
+    }
+    if (!response.ok()) {
+        if (error) {
+            *error = response.error();
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool kislayphp_rpc_discovery_resolve(const std::string &service,
+                                            php_kislayphp_discovery_t::ServiceInstance *instance,
+                                            std::string *error) {
+    auto *stub = kislayphp_rpc_discovery_stub(kislayphp_rpc_discovery_endpoint());
+    if (!stub) {
+        if (error) {
+            *error = "RPC stub unavailable";
+        }
+        return false;
+    }
+
+    kislay::discovery::v1::ResolveRequest request;
+    request.set_service_name(service);
+
+    kislay::discovery::v1::ResolveResponse response;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kislayphp_rpc_timeout_ms()));
+
+    grpc::Status status = stub->Resolve(&context, request, &response);
+    if (!status.ok()) {
+        if (error) {
+            *error = status.error_message();
+        }
+        return false;
+    }
+    if (!response.ok()) {
+        if (error) {
+            *error = response.error();
+        }
+        return false;
+    }
+    if (instance) {
+        const auto &remote = response.instance();
+        instance->service_name = remote.service_name();
+        instance->instance_id = remote.instance_id();
+        instance->url = remote.url();
+        instance->status = remote.status();
+        instance->last_heartbeat_ms = remote.last_heartbeat_ms();
+        instance->metadata.clear();
+        for (const auto &entry : remote.metadata()) {
+            instance->metadata[entry.first] = entry.second;
+        }
+    }
+    return true;
+}
+
+static bool kislayphp_rpc_discovery_list(zval *return_value, std::string *error) {
+    auto *stub = kislayphp_rpc_discovery_stub(kislayphp_rpc_discovery_endpoint());
+    if (!stub) {
+        if (error) {
+            *error = "RPC stub unavailable";
+        }
+        return false;
+    }
+
+    kislay::discovery::v1::ListServicesRequest request;
+    kislay::discovery::v1::ListServicesResponse response;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kislayphp_rpc_timeout_ms()));
+
+    grpc::Status status = stub->ListServices(&context, request, &response);
+    if (!status.ok()) {
+        if (error) {
+            *error = status.error_message();
+        }
+        return false;
+    }
+
+    array_init(return_value);
+    for (const auto &name : response.service_names()) {
+        add_assoc_string(return_value, name.c_str(), "");
+    }
+    return true;
+}
+
+static bool kislayphp_rpc_discovery_list_instances(const std::string &service, zval *return_value, std::string *error) {
+    auto *stub = kislayphp_rpc_discovery_stub(kislayphp_rpc_discovery_endpoint());
+    if (!stub) {
+        if (error) {
+            *error = "RPC stub unavailable";
+        }
+        return false;
+    }
+
+    kislay::discovery::v1::ListInstancesRequest request;
+    request.set_service_name(service);
+    kislay::discovery::v1::ListInstancesResponse response;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kislayphp_rpc_timeout_ms()));
+
+    grpc::Status status = stub->ListInstances(&context, request, &response);
+    if (!status.ok()) {
+        if (error) {
+            *error = status.error_message();
+        }
+        return false;
+    }
+
+    array_init(return_value);
+    for (const auto &remote : response.instances()) {
+        php_kislayphp_discovery_t::ServiceInstance instance;
+        instance.service_name = remote.service_name();
+        instance.instance_id = remote.instance_id();
+        instance.url = remote.url();
+        instance.status = remote.status();
+        instance.last_heartbeat_ms = remote.last_heartbeat_ms();
+        instance.metadata.clear();
+        for (const auto &entry : remote.metadata()) {
+            instance.metadata[entry.first] = entry.second;
+        }
+        kislayphp_add_instance_array(return_value, instance);
+    }
+    return true;
+}
+
+static bool kislayphp_rpc_discovery_heartbeat(const std::string &service, const std::string &instance_id, std::string *error) {
+    auto *stub = kislayphp_rpc_discovery_stub(kislayphp_rpc_discovery_endpoint());
+    if (!stub) {
+        if (error) {
+            *error = "RPC stub unavailable";
+        }
+        return false;
+    }
+
+    kislay::discovery::v1::HeartbeatRequest request;
+    request.set_service_name(service);
+    request.set_instance_id(instance_id);
+    kislay::discovery::v1::HeartbeatResponse response;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kislayphp_rpc_timeout_ms()));
+
+    grpc::Status status = stub->Heartbeat(&context, request, &response);
+    if (!status.ok()) {
+        if (error) {
+            *error = status.error_message();
+        }
+        return false;
+    }
+    if (!response.ok()) {
+        if (error) {
+            *error = response.error();
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool kislayphp_rpc_discovery_set_status(const std::string &service,
+                                               const std::string &instance_id,
+                                               const std::string &status_value,
+                                               std::string *error) {
+    auto *stub = kislayphp_rpc_discovery_stub(kislayphp_rpc_discovery_endpoint());
+    if (!stub) {
+        if (error) {
+            *error = "RPC stub unavailable";
+        }
+        return false;
+    }
+
+    kislay::discovery::v1::SetStatusRequest request;
+    request.set_service_name(service);
+    request.set_instance_id(instance_id);
+    request.set_status(status_value);
+    kislay::discovery::v1::SetStatusResponse response;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kislayphp_rpc_timeout_ms()));
+
+    grpc::Status status = stub->SetStatus(&context, request, &response);
+    if (!status.ok()) {
+        if (error) {
+            *error = status.error_message();
+        }
+        return false;
+    }
+    if (!response.ok()) {
+        if (error) {
+            *error = response.error();
+        }
+        return false;
+    }
+    return true;
+}
+#endif
 
 typedef struct _php_kislayphp_discovery_t {
     struct ServiceInstance {
@@ -344,11 +671,21 @@ PHP_METHOD(KislayPHPDiscovery, register) {
     record.instance_id = instance;
     record.url = service_url;
     record.status = "UP";
-    record.metadata = std::move(metadata);
+    record.metadata = metadata;
     record.last_heartbeat_ms = kislayphp_now_ms();
-    obj->instances[service][instance] = std::move(record);
+    obj->instances[service][instance] = record;
     obj->services[service] = service_url;
     pthread_mutex_unlock(&obj->lock);
+
+#ifdef KISLAYPHP_RPC
+    if (!obj->has_client && kislayphp_rpc_enabled()) {
+        std::string error;
+        if (kislayphp_rpc_discovery_register(service, instance, service_url, metadata, &error)) {
+            kislayphp_discovery_emit(obj, "discovery.register", service, service_url);
+            RETURN_TRUE;
+        }
+    }
+#endif
 
     if (obj->has_client) {
         zval name_zv;
@@ -426,6 +763,21 @@ PHP_METHOD(KislayPHPDiscovery, deregister) {
         RETURN_TRUE;
     }
 
+#ifdef KISLAYPHP_RPC
+    if (kislayphp_rpc_enabled()) {
+        std::string error;
+        std::string instance_value = (instance_id != nullptr && instance_id_len > 0)
+            ? std::string(instance_id, instance_id_len)
+            : std::string();
+        if (kislayphp_rpc_discovery_deregister(key, instance_value.empty() ? std::string() : instance_value, &error)) {
+            if (!url.empty()) {
+                kislayphp_discovery_emit(obj, "discovery.deregister", key, url);
+            }
+            RETURN_TRUE;
+        }
+    }
+#endif
+
     pthread_mutex_lock(&obj->lock);
     auto svc_it = obj->instances.find(key);
     if (svc_it != obj->instances.end()) {
@@ -479,6 +831,15 @@ PHP_METHOD(KislayPHPDiscovery, list) {
         return;
     }
 
+#ifdef KISLAYPHP_RPC
+    if (kislayphp_rpc_enabled()) {
+        std::string error;
+        if (kislayphp_rpc_discovery_list(return_value, &error)) {
+            return;
+        }
+    }
+#endif
+
     array_init(return_value);
     pthread_mutex_lock(&obj->lock);
     for (const auto &entry : obj->services) {
@@ -510,6 +871,19 @@ PHP_METHOD(KislayPHPDiscovery, resolve) {
         RETVAL_ZVAL(&retval, 1, 1);
         return;
     }
+
+#ifdef KISLAYPHP_RPC
+    if (kislayphp_rpc_enabled()) {
+        php_kislayphp_discovery_t::ServiceInstance resolved;
+        std::string error;
+        if (kislayphp_rpc_discovery_resolve(std::string(name, name_len), &resolved, &error)) {
+            if (resolved.url.empty()) {
+                RETURN_NULL();
+            }
+            RETURN_STRING(resolved.url.c_str());
+        }
+    }
+#endif
 
     std::string value;
     bool found = false;
@@ -543,6 +917,15 @@ PHP_METHOD(KislayPHPDiscovery, listInstances) {
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
     array_init(return_value);
 
+#ifdef KISLAYPHP_RPC
+    if (kislayphp_rpc_enabled()) {
+        std::string error;
+        if (kislayphp_rpc_discovery_list_instances(std::string(name, name_len), return_value, &error)) {
+            return;
+        }
+    }
+#endif
+
     pthread_mutex_lock(&obj->lock);
     auto service_it = obj->instances.find(std::string(name, name_len));
     if (service_it != obj->instances.end()) {
@@ -567,6 +950,18 @@ PHP_METHOD(KislayPHPDiscovery, heartbeat) {
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
     bool updated = false;
     std::string key(name, name_len);
+
+#ifdef KISLAYPHP_RPC
+    if (kislayphp_rpc_enabled()) {
+        std::string error;
+        std::string instance_value = (instance_id != nullptr && instance_id_len > 0)
+            ? std::string(instance_id, instance_id_len)
+            : std::string();
+        if (kislayphp_rpc_discovery_heartbeat(key, instance_value.empty() ? key : instance_value, &error)) {
+            RETURN_TRUE;
+        }
+    }
+#endif
 
     pthread_mutex_lock(&obj->lock);
     auto service_it = obj->instances.find(key);
@@ -614,6 +1009,18 @@ PHP_METHOD(KislayPHPDiscovery, setStatus) {
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
     bool updated = false;
     std::string key(name, name_len);
+
+#ifdef KISLAYPHP_RPC
+    if (kislayphp_rpc_enabled()) {
+        std::string error;
+        std::string instance_value = (instance_id != nullptr && instance_id_len > 0)
+            ? std::string(instance_id, instance_id_len)
+            : std::string();
+        if (kislayphp_rpc_discovery_set_status(key, instance_value.empty() ? key : instance_value, normalized, &error)) {
+            RETURN_TRUE;
+        }
+    }
+#endif
 
     pthread_mutex_lock(&obj->lock);
     auto service_it = obj->instances.find(key);

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The KislayPHP Discovery extension provides service discovery and registration capabilities for microservices architectures. It supports both in-memory service registry and pluggable client interfaces for external service discovery systems like Consul, etcd, or ZooKeeper.
+The KislayPHP Discovery extension provides service discovery and registration capabilities for microservices architectures. It supports both in-memory service registry and pluggable client interfaces for external service discovery systems like external registry, distributed KV store, or coordination store.
 
 ## Architecture
 
@@ -229,12 +229,12 @@ $discovery->register('user-service', 'http://localhost:8081');
 <?php
 use KislayPHP\\Discovery\\Discovery;
 
-// Custom Consul client
-class ConsulClient implements KislayPHP\\Discovery\\ClientInterface {
-    private $consulUrl;
+// Custom external registry client
+class RegistryClient implements KislayPHP\\Discovery\\ClientInterface {
+    private $registryUrl;
 
-    public function __construct(string $consulUrl = 'http://localhost:8500') {
-        $this->consulUrl = rtrim($consulUrl, '/');
+    public function __construct(string $registryUrl = 'http://localhost:8500') {
+        $this->registryUrl = rtrim($registryUrl, '/');
     }
 
     public function register(string $name, string $url): bool {
@@ -249,27 +249,27 @@ class ConsulClient implements KislayPHP\\Discovery\\ClientInterface {
             ]
         ];
 
-        $ch = curl_init($this->consulUrl . '/v1/agent/service/register');
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        $ch = http_client_init($this->registryUrl . '/v1/agent/service/register');
+        http_client_setopt($ch, HTTP_OPT_POST, true);
+        http_client_setopt($ch, HTTP_OPT_POSTFIELDS, json_encode($data));
+        http_client_setopt($ch, HTTP_OPT_HTTPHEADER, ['Content-Type: application/json']);
+        http_client_setopt($ch, HTTP_OPT_RETURNTRANSFER, true);
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+        $response = http_client_exec($ch);
+        $httpCode = http_client_getinfo($ch, HTTP_STATUS_CODE);
+        http_client_close($ch);
 
         return $httpCode === 200;
     }
 
     public function deregister(string $name): bool {
-        $ch = curl_init($this->consulUrl . "/v1/agent/service/deregister/$name");
-        curl_setopt($ch, CURLOPT_PUT, true);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        $ch = http_client_init($this->registryUrl . "/v1/agent/service/deregister/$name");
+        http_client_setopt($ch, HTTP_OPT_PUT, true);
+        http_client_setopt($ch, HTTP_OPT_RETURNTRANSFER, true);
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+        $response = http_client_exec($ch);
+        $httpCode = http_client_getinfo($ch, HTTP_STATUS_CODE);
+        http_client_close($ch);
 
         return $httpCode === 200;
     }
@@ -280,12 +280,12 @@ class ConsulClient implements KislayPHP\\Discovery\\ClientInterface {
     }
 
     public function resolveAll(string $name): array {
-        $ch = curl_init($this->consulUrl . "/v1/health/service/$name?passing");
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        $ch = http_client_init($this->registryUrl . "/v1/health/service/$name?passing");
+        http_client_setopt($ch, HTTP_OPT_RETURNTRANSFER, true);
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+        $response = http_client_exec($ch);
+        $httpCode = http_client_getinfo($ch, HTTP_STATUS_CODE);
+        http_client_close($ch);
 
         if ($httpCode !== 200) {
             return [];
@@ -304,12 +304,12 @@ class ConsulClient implements KislayPHP\\Discovery\\ClientInterface {
     }
 
     public function listServices(): array {
-        $ch = curl_init($this->consulUrl . '/v1/agent/services');
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        $ch = http_client_init($this->registryUrl . '/v1/agent/services');
+        http_client_setopt($ch, HTTP_OPT_RETURNTRANSFER, true);
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+        $response = http_client_exec($ch);
+        $httpCode = http_client_getinfo($ch, HTTP_STATUS_CODE);
+        http_client_close($ch);
 
         if ($httpCode !== 200) {
             return [];
@@ -329,12 +329,12 @@ class ConsulClient implements KislayPHP\\Discovery\\ClientInterface {
     }
 }
 
-// Usage with Consul
+// Usage with external registry
 $discovery = new Discovery();
-$consulClient = new ConsulClient('http://consul-server:8500');
-$discovery->setClient($consulClient);
+$registryClient = new RegistryClient('http://registry-server:8500');
+$discovery->setClient($registryClient);
 
-// Services are now registered with Consul
+// Services are now registered with external registry
 $discovery->register('my-service', 'http://localhost:8080');
 $services = $discovery->listServices();
 ```
@@ -354,12 +354,12 @@ class HealthMonitoredDiscovery extends Discovery {
         } else {
             // Default HTTP health check
             $this->healthChecks[$name] = function() use ($url) {
-                $ch = curl_init($url . '/health');
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-                curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
+                $ch = http_client_init($url . '/health');
+                http_client_setopt($ch, HTTP_OPT_RETURNTRANSFER, true);
+                http_client_setopt($ch, HTTP_OPT_TIMEOUT, 5);
+                http_client_exec($ch);
+                $httpCode = http_client_getinfo($ch, HTTP_STATUS_CODE);
+                http_client_close($ch);
                 return $httpCode === 200;
             };
         }
@@ -416,29 +416,29 @@ $app->get('/health', function($req, $res) use ($discovery) {
 
 ## Client Implementations
 
-### Redis-based Service Discovery
+### KV store-based Service Discovery
 ```php
 <?php
-class RedisDiscoveryClient implements KislayPHP\\Discovery\\ClientInterface {
-    private $redis;
+class KeyValueStoreDiscoveryClient implements KislayPHP\\Discovery\\ClientInterface {
+    private $kvStore;
     private $prefix;
 
     public function __construct(string $host = 'localhost', int $port = 6379, string $prefix = 'services:') {
-        $this->redis = new Redis();
-        $this->redis->connect($host, $port);
+        $this->kvStore = new KeyValueStoreClient();
+        $this->kvStore->connect($host, $port);
         $this->prefix = $prefix;
     }
 
     public function register(string $name, string $url): bool {
-        return $this->redis->set($this->prefix . $name, $url);
+        return $this->kvStore->set($this->prefix . $name, $url);
     }
 
     public function deregister(string $name): bool {
-        return $this->redis->del($this->prefix . $name) > 0;
+        return $this->kvStore->del($this->prefix . $name) > 0;
     }
 
     public function resolve(string $name): ?string {
-        $url = $this->redis->get($this->prefix . $name);
+        $url = $this->kvStore->get($this->prefix . $name);
         return $url ?: null;
     }
 
@@ -448,12 +448,12 @@ class RedisDiscoveryClient implements KislayPHP\\Discovery\\ClientInterface {
     }
 
     public function listServices(): array {
-        $keys = $this->redis->keys($this->prefix . '*');
+        $keys = $this->kvStore->keys($this->prefix . '*');
         $services = [];
 
         foreach ($keys as $key) {
             $name = str_replace($this->prefix, '', $key);
-            $services[$name] = $this->redis->get($key);
+            $services[$name] = $this->kvStore->get($key);
         }
 
         return $services;
@@ -522,21 +522,21 @@ class DatabaseDiscoveryClient implements KislayPHP\\Discovery\\ClientInterface {
 }
 ```
 
-### etcd-based Service Discovery
+### Distributed store-based Service Discovery
 ```php
 <?php
-class EtcdDiscoveryClient implements KislayPHP\\Discovery\\ClientInterface {
-    private $etcdUrl;
+class DistributedStoreDiscoveryClient implements KislayPHP\\Discovery\\ClientInterface {
+    private $distStoreUrl;
     private $httpClient;
 
-    public function __construct(string $etcdUrl = 'http://localhost:2379') {
-        $this->etcdUrl = rtrim($etcdUrl, '/');
-        $this->httpClient = new GuzzleHttp\\Client();
+    public function __construct(string $distStoreUrl = 'http://localhost:2379') {
+        $this->distStoreUrl = rtrim($distStoreUrl, '/');
+        $this->httpClient = new HttpClient();
     }
 
     public function register(string $name, string $url): bool {
         try {
-            $this->httpClient->put($this->etcdUrl . '/v3/kv/put', [
+            $this->httpClient->put($this->distStoreUrl . '/v3/kv/put', [
                 'json' => [
                     'key' => base64_encode("services/$name"),
                     'value' => base64_encode($url)
@@ -550,7 +550,7 @@ class EtcdDiscoveryClient implements KislayPHP\\Discovery\\ClientInterface {
 
     public function deregister(string $name): bool {
         try {
-            $this->httpClient->post($this->etcdUrl . '/v3/kv/deleterange', [
+            $this->httpClient->post($this->distStoreUrl . '/v3/kv/deleterange', [
                 'json' => [
                     'key' => base64_encode("services/$name"),
                     'range_end' => base64_encode("services/$name\x00")
@@ -569,7 +569,7 @@ class EtcdDiscoveryClient implements KislayPHP\\Discovery\\ClientInterface {
 
     public function resolveAll(string $name): array {
         try {
-            $response = $this->httpClient->post($this->etcdUrl . '/v3/kv/range', [
+            $response = $this->httpClient->post($this->distStoreUrl . '/v3/kv/range', [
                 'json' => [
                     'key' => base64_encode("services/$name")
                 ]
@@ -590,7 +590,7 @@ class EtcdDiscoveryClient implements KislayPHP\\Discovery\\ClientInterface {
 
     public function listServices(): array {
         try {
-            $response = $this->httpClient->post($this->etcdUrl . '/v3/kv/range', [
+            $response = $this->httpClient->post($this->distributedKvStoreUrl . '/v3/kv/range', [
                 'json' => [
                     'key' => base64_encode('services/'),
                     'range_end' => base64_encode('services0')
@@ -631,13 +631,13 @@ class ServiceMeshDiscovery extends Discovery {
         // Use service mesh sidecar for service discovery
         $sidecarUrl = "http://localhost:{$this->sidecarPort}/resolve/$name";
 
-        $ch = curl_init($sidecarUrl);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 2);
+        $ch = http_client_init($sidecarUrl);
+        http_client_setopt($ch, HTTP_OPT_RETURNTRANSFER, true);
+        http_client_setopt($ch, HTTP_OPT_TIMEOUT, 2);
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+        $response = http_client_exec($ch);
+        $httpCode = http_client_getinfo($ch, HTTP_STATUS_CODE);
+        http_client_close($ch);
 
         if ($httpCode === 200) {
             $data = json_decode($response, true);
@@ -668,12 +668,12 @@ class ServiceMeshDiscovery extends Discovery {
             ]
         ];
 
-        $ch = curl_init($controlPlaneUrl . '/services');
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-        curl_exec($ch);
-        curl_close($ch);
+        $ch = http_client_init($controlPlaneUrl . '/services');
+        http_client_setopt($ch, HTTP_OPT_POST, true);
+        http_client_setopt($ch, HTTP_OPT_POSTFIELDS, json_encode($data));
+        http_client_setopt($ch, HTTP_OPT_HTTPHEADER, ['Content-Type: application/json']);
+        http_client_exec($ch);
+        http_client_close($ch);
     }
 }
 ```
@@ -804,12 +804,12 @@ class CachedDiscovery extends Discovery {
 
 ## Integration Examples
 
-### Docker Compose Service Discovery
+### compose Service Discovery
 ```yaml
 version: '3.8'
 services:
   discovery:
-    image: consul:1.15
+    image: registry:1.15
     ports:
       - "8500:8500"
     command: agent -server -bootstrap -ui -client 0.0.0.0
@@ -817,7 +817,7 @@ services:
   user-service:
     build: ./user-service
     environment:
-      - CONSUL_URL=http://discovery:8500
+      - REGISTRY_URL=http://discovery:8500
       - SERVICE_NAME=user-service
     depends_on:
       - discovery
@@ -825,17 +825,17 @@ services:
   order-service:
     build: ./order-service
     environment:
-      - CONSUL_URL=http://discovery:8500
+      - REGISTRY_URL=http://discovery:8500
       - SERVICE_NAME=order-service
     depends_on:
       - discovery
 ```
 
 ```php
-// Service registration in Docker
+// Service registration in container
 $discovery = new Discovery();
-$consulClient = new ConsulClient(getenv('CONSUL_URL') ?: 'http://localhost:8500');
-$discovery->setClient($consulClient);
+$registryClient = new RegistryClient(getenv('REGISTRY_URL') ?: 'http://localhost:8500');
+$discovery->setClient($registryClient);
 
 // Register this service
 $serviceName = getenv('SERVICE_NAME');
@@ -843,22 +843,22 @@ $servicePort = getenv('PORT') ?: 8080;
 $discovery->register($serviceName, "http://$serviceName:$servicePort");
 ```
 
-### Kubernetes Service Discovery
+### orchestrator Service Discovery
 ```php
 <?php
-class KubernetesDiscovery extends Discovery {
+class orchestratorDiscovery extends Discovery {
     private $namespace;
-    private $kubernetesApi;
+    private $orchestratorApi;
 
     public function __construct(string $namespace = 'default') {
         parent::__construct();
         $this->namespace = $namespace;
-        $this->kubernetesApi = $this->createKubernetesClient();
+        $this->orchestratorApi = $this->createOrchestratorClient();
     }
 
     public function resolve(string $name): ?string {
         try {
-            $endpoint = $this->kubernetesApi->get("/api/v1/namespaces/{$this->namespace}/endpoints/$name");
+            $endpoint = $this->orchestratorApi->get("/api/v1/namespaces/{$this->namespace}/endpoints/$name");
             $subsets = $endpoint['subsets'] ?? [];
 
             foreach ($subsets as $subset) {
@@ -880,12 +880,12 @@ class KubernetesDiscovery extends Discovery {
 
     public function listServices(): array {
         try {
-            $services = $this->kubernetesApi->get("/api/v1/namespaces/{$this->namespace}/services");
+            $services = $this->orchestratorApi->get("/api/v1/namespaces/{$this->namespace}/services");
             $result = [];
 
             foreach ($services['items'] ?? [] as $service) {
                 $name = $service['metadata']['name'];
-                // In Kubernetes, we typically use service names directly
+                // In orchestrator, we typically use service names directly
                 $result[$name] = "http://$name.{$this->namespace}.svc.cluster.local";
             }
 
@@ -895,17 +895,17 @@ class KubernetesDiscovery extends Discovery {
         }
     }
 
-    private function createKubernetesClient() {
-        // Use Kubernetes service account token
-        $token = file_get_contents('/var/run/secrets/kubernetes.io/serviceaccount/token');
-        $caCert = file_get_contents('/var/run/secrets/kubernetes.io/serviceaccount/ca.crt');
+    private function createOrchestratorClient() {
+        // Use orchestrator service account token
+        $token = file_get_contents('/var/run/secrets/orchestrator.io/serviceaccount/token');
+        $caCert = file_get_contents('/var/run/secrets/orchestrator.io/serviceaccount/ca.crt');
 
-        return new KubernetesApiClient($token, $caCert);
+        return new orchestratorApiClient($token, $caCert);
     }
 }
 
-// Usage in Kubernetes
-$discovery = new KubernetesDiscovery();
+// Usage in orchestrator
+$discovery = new orchestratorDiscovery();
 $userServiceUrl = $discovery->resolve('user-service');
 // Returns: http://user-service.default.svc.cluster.local
 ```

@@ -5,23 +5,23 @@
 [![Build Status](https://img.shields.io/github/actions/workflow/status/KislayPHP/discovery/ci.yml)](https://github.com/KislayPHP/discovery/actions)
 [![codecov](https://codecov.io/gh/KislayPHP/discovery/branch/main/graph/badge.svg)](https://codecov.io/gh/KislayPHP/discovery)
 
-A high-performance C++ PHP extension providing service discovery and registration for microservices with support for Consul, etcd, and custom backends. Perfect for PHP echo system integration and modern microservices architecture.
+A high-performance C++ PHP extension providing service discovery and registration for microservices with support for external registry, distributed KV store, and custom backends. Perfect for PHP ecosystem integration and modern microservices architecture.
 
 ## ⚡ Key Features
 
 - 🚀 **High Performance**: Fast service lookups with caching
-- 🔍 **Multiple Backends**: Support for Consul, etcd, ZooKeeper, and custom clients
+- 🔍 **Multiple Backends**: Support for external registry, distributed KV store, coordination store, and custom clients
 - 💓 **Health Monitoring**: Automatic service health checks and status tracking
 - 📢 **Event Integration**: Service change notifications via EventBus
 - 🔄 **Auto-Registration**: Automatic service registration with metadata
 - 📊 **Metrics**: Service discovery statistics and monitoring
 - 🌐 **Multi-Datacenter**: Cross-datacenter service discovery support
-- 🔄 **PHP Echo System**: Seamless integration with PHP ecosystem and frameworks
+- 🔄 **PHP Ecosystem**: Seamless integration with PHP ecosystem and frameworks
 - 🌐 **Microservices Architecture**: Designed for distributed PHP applications
 
-### Spring Cloud-style Discovery Features
+### KislayPHP-native Discovery Features
 
-`ServiceRegistry` now supports instance-level registration similar to Spring service discovery patterns:
+`ServiceRegistry` now supports instance-level registration for KislayPHP-native service discovery:
 
 - Multiple instances per service (`instanceId`)
 - Instance metadata (zone/version/labels)
@@ -69,9 +69,9 @@ make
 sudo make install
 ```
 
-### Docker
+### container
 
-```dockerfile
+```containerfile
 FROM php:8.2-cli
 ```
 
@@ -140,17 +140,17 @@ echo "Service healthy: " . ($health ? 'Yes' : 'No') . "\n";
 ```php
 <?php
 
-// Use Consul backend
+// Use external registry backend
 $discovery = new KislayDiscovery([
-    'backend' => 'consul',
-    'consul' => [
-        'host' => 'consul-server:8500',
+    'backend' => 'registry',
+    'registry' => [
+        'host' => 'registry-server:8500',
         'datacenter' => 'dc1',
-        'token' => 'your-consul-token'
+        'token' => 'your-registry-token'
     ]
 ]);
 
-// Services automatically registered in Consul
+// Services automatically registered in external registry
 $discovery->register('payment-service', '10.0.0.2', 8080);
 ```
 
@@ -177,9 +177,32 @@ KislayPHP Discovery implements a distributed service registry:
             ┌─────────────────┐
             │ Service         │
             │ Registry        │
-            │ (Consul/etcd/   │
+            │ (external registry/distributed KV store/   │
             │  Custom)        │
             └─────────────────┘
+
+### RPC Server-Client Mode (registry-style)
+
+You can also run a dedicated discovery server over RPC and use clients to register/renew and resolve services.
+
+Build and run the server:
+
+```bash
+cd discovery_server
+cmake -S . -B build
+cmake --build build -j
+./build/kislay_discovery_server --bind 0.0.0.0:9090
+```
+
+Generate client libraries using the RPC proto:
+
+```bash
+protoc -I discovery_server/proto \
+    --php_out=./gen/php \
+    --rpc_out=./gen/php \
+    --plugin=protoc-gen-rpc=$(which rpc_php_plugin) \
+    discovery_server/proto/discovery.proto
+```
 ```
 
 ## 🎯 Use Cases
@@ -216,16 +239,16 @@ kislayphp.discovery.health_check_interval = 30
 kislayphp.discovery.deregister_timeout = 300
 
 ; Backend settings
-kislayphp.discovery.backend = "consul"
-kislayphp.discovery.consul_host = "localhost:8500"
-kislayphp.discovery.etcd_endpoints = "localhost:2379"
+kislayphp.discovery.backend = "registry"
+kislayphp.discovery.registry_host = "localhost:8500"
+kislayphp.discovery.distributed KV store_endpoints = "localhost:2379"
 ```
 
 ### Environment Variables
 
 ```bash
-export KISLAYPHP_DISCOVERY_BACKEND=consul
-export KISLAYPHP_DISCOVERY_CONSUL_HOST=consul-server:8500
+export KISLAYPHP_DISCOVERY_BACKEND=registry
+export KISLAYPHP_DISCOVERY_REGISTRY_HOST=registry-server:8500
 export KISLAYPHP_DISCOVERY_HEALTH_CHECK_INTERVAL=30
 export KISLAYPHP_DISCOVERY_CACHE_SIZE=10000
 ```
@@ -236,9 +259,9 @@ export KISLAYPHP_DISCOVERY_CACHE_SIZE=10000
 # Run unit tests
 php run-tests.php
 
-# Test with Consul backend
+# Test with external registry backend
 cd tests/
-php test_consul_integration.php
+php test_registry_integration.php
 
 # Test service registration/discovery
 php test_service_lifecycle.php
@@ -261,7 +284,7 @@ Licensed under the [Apache License 2.0](LICENSE).
 
 ## 📈 Roadmap
 
-- [ ] Kubernetes service discovery
+- [ ] orchestrator service discovery
 - [ ] AWS ECS service integration
 - [ ] Advanced health check patterns
 - [ ] Service mesh integration
@@ -269,9 +292,9 @@ Licensed under the [Apache License 2.0](LICENSE).
 
 ## 🙏 Acknowledgments
 
-- **Consul**: Service discovery and health checking
-- **etcd**: Distributed key-value store
-- **ZooKeeper**: Distributed coordination service
+- **external registry**: Service discovery and health checking
+- **distributed KV store**: Distributed KV store
+- **coordination store**: Distributed coordination service
 - **PHP**: Zend API for extension development
 
 ---
@@ -312,7 +335,7 @@ php -d extension=modules/kislayphp_discovery.so -d extension=/path/to/eventbus/m
 
 ## Custom Client Interface
 
-Default is in-memory. To plug in Redis, MySQL, Mongo, or any other backend, provide
+Default is in-memory. To plug in KV store, MySQL, Mongo, or any other backend, provide
 your own PHP client that implements `KislayPHP\Discovery\ClientInterface` and call
 `setClient()`.
 
@@ -344,6 +367,6 @@ print_r($registry->list());
 
 ## SEO Keywords
 
-PHP, microservices, PHP echo system, PHP extension, C++ PHP extension, PHP service discovery, PHP service registry, PHP Consul, PHP etcd, PHP ZooKeeper, PHP health checks, PHP microservices discovery, distributed PHP services
+PHP, microservices, PHP ecosystem, PHP extension, C++ PHP extension, PHP service discovery, PHP service registry, PHP external registry, PHP distributed KV store, PHP coordination store, PHP health checks, PHP microservices discovery, distributed PHP services
 
 ---
