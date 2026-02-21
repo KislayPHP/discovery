@@ -101,6 +101,15 @@ static std::string kislayphp_env_string(const char *name, const std::string &fal
     return std::string(value);
 }
 
+static zend_long kislayphp_sanitize_heartbeat_timeout_ms(zend_long value, const char *source) {
+    if (value < 1000) {
+        php_error_docref(nullptr, E_WARNING, "%s: heartbeat timeout %lldms is too low; using 1000ms",
+                         source, static_cast<long long>(value));
+        return 1000;
+    }
+    return value;
+}
+
 #ifdef KISLAYPHP_RPC
 static bool kislayphp_rpc_enabled() {
     return kislayphp_env_bool("KISLAY_RPC_ENABLED", false);
@@ -407,6 +416,7 @@ typedef struct _php_kislayphp_discovery_t {
     bool has_bus;
     zval client;
     bool has_client;
+    zend_long heartbeat_timeout_ms;
     zend_object std;
 } php_kislayphp_discovery_t;
 
@@ -430,6 +440,9 @@ static zend_object *kislayphp_discovery_create_object(zend_class_entry *ce) {
     obj->has_bus = false;
     ZVAL_UNDEF(&obj->client);
     obj->has_client = false;
+    obj->heartbeat_timeout_ms = kislayphp_sanitize_heartbeat_timeout_ms(
+        kislayphp_env_long("KISLAY_DISCOVERY_HEARTBEAT_TIMEOUT_MS", 90000),
+        "Kislay\\Discovery\\ServiceRegistry::__construct");
     obj->std.handlers = &kislayphp_discovery_handlers;
     return &obj->std;
 }
@@ -539,11 +552,13 @@ static bool kislayphp_select_healthy_instance(php_kislayphp_discovery_t *obj,
         return false;
     }
 
+    const long long now_ms = kislayphp_now_ms();
     std::vector<const php_kislayphp_discovery_t::ServiceInstance *> healthy;
     healthy.reserve(service_it->second.size());
     for (const auto &instance_it : service_it->second) {
         const auto &instance = instance_it.second;
-        if (instance.status == "UP") {
+        const bool is_fresh = (now_ms - instance.last_heartbeat_ms) <= static_cast<long long>(obj->heartbeat_timeout_ms);
+        if (instance.status == "UP" && is_fresh) {
             healthy.push_back(&instance);
         }
     }
@@ -581,7 +596,11 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_set_bus, 0, 0, 1)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_set_client, 0, 0, 1)
-    ZEND_ARG_OBJ_INFO(0, client, KislayPHP\\Discovery\\ClientInterface, 0)
+    ZEND_ARG_OBJ_INFO(0, client, Kislay\\Discovery\\ClientInterface, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_set_heartbeat_timeout, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, milliseconds, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_discovery_client_register, 0, 0, 2)
@@ -624,7 +643,7 @@ PHP_METHOD(KislayPHPDiscovery, setClient) {
     }
 
     if (!instanceof_function(Z_OBJCE_P(client), kislayphp_discovery_client_ce)) {
-        zend_throw_exception(zend_ce_exception, "Client must implement KislayPHP\\Discovery\\ClientInterface", 0);
+        zend_throw_exception(zend_ce_exception, "Client must implement Kislay\\Discovery\\ClientInterface", 0);
         RETURN_FALSE;
     }
 
@@ -890,9 +909,12 @@ PHP_METHOD(KislayPHPDiscovery, resolve) {
     pthread_mutex_lock(&obj->lock);
     std::string key(name, name_len);
     php_kislayphp_discovery_t::ServiceInstance selected;
-    if (kislayphp_select_healthy_instance(obj, key, &selected)) {
-        value = selected.url;
-        found = true;
+    auto service_instances_it = obj->instances.find(key);
+    if (service_instances_it != obj->instances.end() && !service_instances_it->second.empty()) {
+        if (kislayphp_select_healthy_instance(obj, key, &selected)) {
+            value = selected.url;
+            found = true;
+        }
     } else {
         auto it = obj->services.find(key);
         if (it != obj->services.end()) {
@@ -1043,6 +1065,19 @@ PHP_METHOD(KislayPHPDiscovery, setStatus) {
     RETURN_BOOL(updated);
 }
 
+PHP_METHOD(KislayPHPDiscovery, setHeartbeatTimeout) {
+    zend_long milliseconds = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(milliseconds)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    obj->heartbeat_timeout_ms = kislayphp_sanitize_heartbeat_timeout_ms(
+        milliseconds,
+        "Kislay\\Discovery\\ServiceRegistry::setHeartbeatTimeout");
+    RETURN_TRUE;
+}
+
 PHP_METHOD(KislayPHPDiscovery, setBus) {
     zval *bus = nullptr;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1073,6 +1108,7 @@ static const zend_function_entry kislayphp_discovery_methods[] = {
     PHP_ME(KislayPHPDiscovery, listInstances, arginfo_kislayphp_discovery_list_instances, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPDiscovery, heartbeat, arginfo_kislayphp_discovery_heartbeat, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPDiscovery, setStatus, arginfo_kislayphp_discovery_set_status, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPDiscovery, setHeartbeatTimeout, arginfo_kislayphp_discovery_set_heartbeat_timeout, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPDiscovery, setBus, arginfo_kislayphp_discovery_set_bus, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPDiscovery, setClient, arginfo_kislayphp_discovery_set_client, ZEND_ACC_PUBLIC)
     PHP_FE_END
@@ -1088,10 +1124,12 @@ static const zend_function_entry kislayphp_discovery_client_methods[] = {
 
 PHP_MINIT_FUNCTION(kislayphp_discovery) {
     zend_class_entry ce;
-    INIT_NS_CLASS_ENTRY(ce, "KislayPHP\\Discovery", "ClientInterface", kislayphp_discovery_client_methods);
+    INIT_NS_CLASS_ENTRY(ce, "Kislay\\Discovery", "ClientInterface", kislayphp_discovery_client_methods);
     kislayphp_discovery_client_ce = zend_register_internal_interface(&ce);
-    INIT_NS_CLASS_ENTRY(ce, "KislayPHP\\Discovery", "ServiceRegistry", kislayphp_discovery_methods);
+    zend_register_class_alias("KislayPHP\\Discovery\\ClientInterface", kislayphp_discovery_client_ce);
+    INIT_NS_CLASS_ENTRY(ce, "Kislay\\Discovery", "ServiceRegistry", kislayphp_discovery_methods);
     kislayphp_discovery_ce = zend_register_internal_class(&ce);
+    zend_register_class_alias("KislayPHP\\Discovery\\ServiceRegistry", kislayphp_discovery_ce);
     kislayphp_discovery_ce->create_object = kislayphp_discovery_create_object;
     std::memcpy(&kislayphp_discovery_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     kislayphp_discovery_handlers.offset = XtOffsetOf(php_kislayphp_discovery_t, std);

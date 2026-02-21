@@ -11,9 +11,9 @@ if (!extension_loaded('kislayphp_discovery')) {
 	fail('kislayphp_discovery not loaded');
 }
 
-$registry = new KislayPHP\Discovery\ServiceRegistry();
+$registry = new Kislay\Discovery\ServiceRegistry();
 
-class ArrayDiscoveryClient implements KislayPHP\Discovery\ClientInterface {
+class ArrayDiscoveryClient implements Kislay\Discovery\ClientInterface {
 	private array $services = [];
 
 	public function register(string $name, string $url): bool {

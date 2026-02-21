@@ -5,7 +5,7 @@ extern "C" {
 #include "php.h"
 }
 
-#define PHP_KISLAYPHP_DISCOVERY_VERSION "0.1"
+#define PHP_KISLAYPHP_DISCOVERY_VERSION "0.0.1"
 #define PHP_KISLAYPHP_DISCOVERY_EXTNAME "kislayphp_discovery"
 
 extern zend_module_entry kislayphp_discovery_module_entry;
