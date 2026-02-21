@@ -9,6 +9,7 @@ extern "C" {
 #include "php_kislayphp_discovery.h"
 
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <pthread.h>
 #include <cstdlib>
@@ -68,6 +69,7 @@ static inline void kislayphp_call_method_with_2_params(
 #define zend_call_method_with_2_params(obj, obj_ce, fn_proxy, function_name, retval, param1, param2) \
     kislayphp_call_method_with_2_params(obj, obj_ce, fn_proxy, function_name, retval, param1, param2)
 #endif
+
 static zend_class_entry *kislayphp_discovery_ce;
 static zend_class_entry *kislayphp_discovery_client_ce;
 
@@ -544,6 +546,41 @@ static void kislayphp_add_instance_array(zval *target, const php_kislayphp_disco
     add_next_index_zval(target, &item);
 }
 
+static bool kislayphp_object_has_method(zval *object, const char *method_name) {
+    if (object == nullptr || Z_TYPE_P(object) != IS_OBJECT || method_name == nullptr) {
+        return false;
+    }
+    std::string lookup(method_name);
+    for (char &ch : lookup) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return zend_hash_str_exists(&Z_OBJCE_P(object)->function_table, lookup.c_str(), lookup.size());
+}
+
+static bool kislayphp_call_object_method(zval *object,
+                                         const char *method_name,
+                                         uint32_t argc,
+                                         zval *argv,
+                                         zval *retval) {
+    if (retval != nullptr) {
+        ZVAL_UNDEF(retval);
+    }
+    if (!kislayphp_object_has_method(object, method_name)) {
+        return false;
+    }
+
+    zval callable;
+    array_init(&callable);
+    zval obj_copy;
+    ZVAL_COPY(&obj_copy, object);
+    add_next_index_zval(&callable, &obj_copy);
+    add_next_index_string(&callable, method_name);
+
+    int call_result = call_user_function(EG(function_table), nullptr, &callable, retval, argc, argv);
+    zval_ptr_dtor(&callable);
+    return call_result == SUCCESS;
+}
+
 static bool kislayphp_select_healthy_instance(php_kislayphp_discovery_t *obj,
                                               const std::string &service,
                                               php_kislayphp_discovery_t::ServiceInstance *selected) {
@@ -707,17 +744,47 @@ PHP_METHOD(KislayPHPDiscovery, register) {
 #endif
 
     if (obj->has_client) {
-        zval name_zv;
-        zval url_zv;
-        ZVAL_STRINGL(&name_zv, name, name_len);
-        ZVAL_STRINGL(&url_zv, url, url_len);
-
         zval retval;
         ZVAL_UNDEF(&retval);
-        zend_call_method_with_2_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "register", &retval, &name_zv, &url_zv);
+        bool called = false;
 
-        zval_ptr_dtor(&name_zv);
-        zval_ptr_dtor(&url_zv);
+        if (kislayphp_object_has_method(&obj->client, "registerInstance")) {
+            zval args[4];
+            ZVAL_STRINGL(&args[0], name, name_len);
+            ZVAL_STRINGL(&args[1], url, url_len);
+            if (metadata_zv != nullptr && Z_TYPE_P(metadata_zv) == IS_ARRAY) {
+                ZVAL_COPY(&args[2], metadata_zv);
+            } else {
+                array_init(&args[2]);
+            }
+            if (instance_id != nullptr && instance_id_len > 0) {
+                ZVAL_STRINGL(&args[3], instance_id, instance_id_len);
+            } else {
+                ZVAL_NULL(&args[3]);
+            }
+
+            called = kislayphp_call_object_method(&obj->client, "registerInstance", 4, args, &retval);
+            zval_ptr_dtor(&args[0]);
+            zval_ptr_dtor(&args[1]);
+            zval_ptr_dtor(&args[2]);
+            zval_ptr_dtor(&args[3]);
+        }
+
+        if (!called) {
+            zval args[2];
+            ZVAL_STRINGL(&args[0], name, name_len);
+            ZVAL_STRINGL(&args[1], url, url_len);
+            called = kislayphp_call_object_method(&obj->client, "register", 2, args, &retval);
+            zval_ptr_dtor(&args[0]);
+            zval_ptr_dtor(&args[1]);
+        }
+
+        if (!called || EG(exception) != nullptr) {
+            if (!Z_ISUNDEF(retval)) {
+                zval_ptr_dtor(&retval);
+            }
+            RETURN_FALSE;
+        }
 
         if (!Z_ISUNDEF(retval) && Z_TYPE(retval) == IS_FALSE) {
             zval_ptr_dtor(&retval);
@@ -750,23 +817,47 @@ PHP_METHOD(KislayPHPDiscovery, deregister) {
     std::string url;
 
     if (obj->has_client) {
-        zval name_zv;
-        ZVAL_STRINGL(&name_zv, name, name_len);
-
-        zval resolve_ret;
-        ZVAL_UNDEF(&resolve_ret);
-        zend_call_method_with_1_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "resolve", &resolve_ret, &name_zv);
-        if (Z_TYPE(resolve_ret) == IS_STRING) {
-            url.assign(Z_STRVAL(resolve_ret), Z_STRLEN(resolve_ret));
-        }
-        if (!Z_ISUNDEF(resolve_ret)) {
-            zval_ptr_dtor(&resolve_ret);
-        }
-
         zval retval;
         ZVAL_UNDEF(&retval);
-        zend_call_method_with_1_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "deregister", &retval, &name_zv);
-        zval_ptr_dtor(&name_zv);
+        zval resolve_ret;
+        ZVAL_UNDEF(&resolve_ret);
+
+        if (kislayphp_object_has_method(&obj->client, "resolve")) {
+            zval resolve_args[1];
+            ZVAL_STRINGL(&resolve_args[0], name, name_len);
+            bool resolved = kislayphp_call_object_method(&obj->client, "resolve", 1, resolve_args, &resolve_ret);
+            zval_ptr_dtor(&resolve_args[0]);
+            if (resolved && Z_TYPE(resolve_ret) == IS_STRING) {
+                url.assign(Z_STRVAL(resolve_ret), Z_STRLEN(resolve_ret));
+            }
+            if (!Z_ISUNDEF(resolve_ret)) {
+                zval_ptr_dtor(&resolve_ret);
+            }
+        }
+
+        bool called = false;
+        if (instance_id != nullptr && instance_id_len > 0 &&
+            kislayphp_object_has_method(&obj->client, "deregisterInstance")) {
+            zval args[2];
+            ZVAL_STRINGL(&args[0], name, name_len);
+            ZVAL_STRINGL(&args[1], instance_id, instance_id_len);
+            called = kislayphp_call_object_method(&obj->client, "deregisterInstance", 2, args, &retval);
+            zval_ptr_dtor(&args[0]);
+            zval_ptr_dtor(&args[1]);
+        }
+        if (!called) {
+            zval args[1];
+            ZVAL_STRINGL(&args[0], name, name_len);
+            called = kislayphp_call_object_method(&obj->client, "deregister", 1, args, &retval);
+            zval_ptr_dtor(&args[0]);
+        }
+
+        if (!called || EG(exception) != nullptr) {
+            if (!Z_ISUNDEF(retval)) {
+                zval_ptr_dtor(&retval);
+            }
+            RETURN_FALSE;
+        }
 
         if (!Z_ISUNDEF(retval) && Z_TYPE(retval) == IS_FALSE) {
             zval_ptr_dtor(&retval);
@@ -937,6 +1028,23 @@ PHP_METHOD(KislayPHPDiscovery, listInstances) {
     ZEND_PARSE_PARAMETERS_END();
 
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client && kislayphp_object_has_method(&obj->client, "listInstances")) {
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zval args[1];
+        ZVAL_STRINGL(&args[0], name, name_len);
+        bool called = kislayphp_call_object_method(&obj->client, "listInstances", 1, args, &retval);
+        zval_ptr_dtor(&args[0]);
+        if (called && EG(exception) == nullptr && !Z_ISUNDEF(retval)) {
+            RETVAL_ZVAL(&retval, 1, 1);
+            return;
+        }
+        if (!Z_ISUNDEF(retval)) {
+            zval_ptr_dtor(&retval);
+        }
+        array_init(return_value);
+        return;
+    }
     array_init(return_value);
 
 #ifdef KISLAYPHP_RPC
@@ -972,6 +1080,40 @@ PHP_METHOD(KislayPHPDiscovery, heartbeat) {
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
     bool updated = false;
     std::string key(name, name_len);
+
+    if (obj->has_client && kislayphp_object_has_method(&obj->client, "heartbeat")) {
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        bool called = false;
+        if (instance_id != nullptr && instance_id_len > 0) {
+            zval args[2];
+            ZVAL_STRINGL(&args[0], name, name_len);
+            ZVAL_STRINGL(&args[1], instance_id, instance_id_len);
+            called = kislayphp_call_object_method(&obj->client, "heartbeat", 2, args, &retval);
+            zval_ptr_dtor(&args[0]);
+            zval_ptr_dtor(&args[1]);
+        } else {
+            zval args[1];
+            ZVAL_STRINGL(&args[0], name, name_len);
+            called = kislayphp_call_object_method(&obj->client, "heartbeat", 1, args, &retval);
+            zval_ptr_dtor(&args[0]);
+        }
+
+        if (!called || EG(exception) != nullptr) {
+            if (!Z_ISUNDEF(retval)) {
+                zval_ptr_dtor(&retval);
+            }
+            RETURN_FALSE;
+        }
+        if (!Z_ISUNDEF(retval) && Z_TYPE(retval) == IS_FALSE) {
+            zval_ptr_dtor(&retval);
+            RETURN_FALSE;
+        }
+        if (!Z_ISUNDEF(retval)) {
+            zval_ptr_dtor(&retval);
+        }
+        RETURN_TRUE;
+    }
 
 #ifdef KISLAYPHP_RPC
     if (kislayphp_rpc_enabled()) {
@@ -1031,6 +1173,44 @@ PHP_METHOD(KislayPHPDiscovery, setStatus) {
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
     bool updated = false;
     std::string key(name, name_len);
+
+    if (obj->has_client && kislayphp_object_has_method(&obj->client, "setStatus")) {
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        bool called = false;
+        if (instance_id != nullptr && instance_id_len > 0) {
+            zval args[3];
+            ZVAL_STRINGL(&args[0], name, name_len);
+            ZVAL_STRINGL(&args[1], normalized.c_str(), normalized.size());
+            ZVAL_STRINGL(&args[2], instance_id, instance_id_len);
+            called = kislayphp_call_object_method(&obj->client, "setStatus", 3, args, &retval);
+            zval_ptr_dtor(&args[0]);
+            zval_ptr_dtor(&args[1]);
+            zval_ptr_dtor(&args[2]);
+        } else {
+            zval args[2];
+            ZVAL_STRINGL(&args[0], name, name_len);
+            ZVAL_STRINGL(&args[1], normalized.c_str(), normalized.size());
+            called = kislayphp_call_object_method(&obj->client, "setStatus", 2, args, &retval);
+            zval_ptr_dtor(&args[0]);
+            zval_ptr_dtor(&args[1]);
+        }
+
+        if (!called || EG(exception) != nullptr) {
+            if (!Z_ISUNDEF(retval)) {
+                zval_ptr_dtor(&retval);
+            }
+            RETURN_FALSE;
+        }
+        if (!Z_ISUNDEF(retval) && Z_TYPE(retval) == IS_FALSE) {
+            zval_ptr_dtor(&retval);
+            RETURN_FALSE;
+        }
+        if (!Z_ISUNDEF(retval)) {
+            zval_ptr_dtor(&retval);
+        }
+        RETURN_TRUE;
+    }
 
 #ifdef KISLAYPHP_RPC
     if (kislayphp_rpc_enabled()) {

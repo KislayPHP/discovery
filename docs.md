@@ -185,6 +185,55 @@ interface Kislay\Discovery\ClientInterface {
 }
 ```
 
+If your custom client class also defines richer methods below, `ServiceRegistry` will use them automatically:
+
+- `registerInstance(string $name, string $url, array $metadata = [], ?string $instanceId = null): bool`
+- `deregisterInstance(string $name, ?string $instanceId = null): bool`
+- `listInstances(string $name): array`
+- `heartbeat(string $name, ?string $instanceId = null): bool`
+- `setStatus(string $name, string $status, ?string $instanceId = null): bool`
+
+## Separate Registry Deployment
+
+Deploy discovery as a standalone process and use remote registration/resolution.
+
+Reference files:
+
+- `examples/standalone_registry/registry_server.php`
+- `examples/standalone_registry/HttpDiscoveryClient.php`
+- `examples/standalone_registry/service_example.php`
+- `examples/standalone_registry/gateway_example.php`
+
+### Registry API (from `registry_server.php`)
+
+- `POST /v1/register` body: `service`, `url`, optional `instanceId`, `metadata`
+- `POST /v1/deregister` body: `service`, optional `instanceId`
+- `POST /v1/heartbeat` body: `service`, optional `instanceId`
+- `POST /v1/status` body: `service`, `status`, optional `instanceId`
+- `GET /v1/resolve?service=<name>`
+- `GET /v1/services`
+- `GET /v1/instances?service=<name>`
+- `GET /health`
+
+### Service Self-registration Pattern
+
+Service process startup:
+
+1. Create `HttpDiscoveryClient`
+2. Register service URL and instance ID
+3. Start service listener
+4. Send heartbeat periodically
+5. Deregister on shutdown
+
+### Gateway Consumption Pattern
+
+Gateway process startup:
+
+1. Add logical service routes with `addServiceRoute()`
+2. Use `setResolver()` callback
+3. Resolver calls remote registry (`resolve(service)`)
+4. Gateway proxies to returned URL
+
 ## RPC Mode (Optional Build)
 
 If extension is compiled with RPC support, remote calls can be enabled via:

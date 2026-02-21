@@ -55,6 +55,49 @@ $instances = $registry->listInstances('user-service');
 var_dump($url, $instances);
 ```
 
+## Standalone Service Registry
+
+You can run `ServiceRegistry` as a separate process and let services register themselves remotely.
+
+Reference implementation:
+
+- `examples/standalone_registry/registry_server.php`
+- `examples/standalone_registry/HttpDiscoveryClient.php`
+- `examples/standalone_registry/service_example.php`
+- `examples/standalone_registry/gateway_example.php`
+
+Flow:
+
+1. Start registry process:
+
+```bash
+cd examples/standalone_registry
+REGISTRY_HOST=0.0.0.0 REGISTRY_PORT=9090 php registry_server.php
+```
+
+2. Start services (self-registration + heartbeat):
+
+```bash
+REGISTRY_URL=http://127.0.0.1:9090 SERVICE_NAME=user-service SERVICE_PORT=9101 SERVICE_URL=http://127.0.0.1:9101 SERVICE_ROUTE=/api/users INSTANCE_ID=user-1 php service_example.php
+```
+
+```bash
+REGISTRY_URL=http://127.0.0.1:9090 SERVICE_NAME=order-service SERVICE_PORT=9102 SERVICE_URL=http://127.0.0.1:9102 SERVICE_ROUTE=/api/orders INSTANCE_ID=order-1 php service_example.php
+```
+
+3. Start gateway that consumes registry:
+
+```bash
+REGISTRY_URL=http://127.0.0.1:9090 GATEWAY_PORT=9008 php gateway_example.php
+```
+
+4. Call gateway routes:
+
+```bash
+curl -i http://127.0.0.1:9008/api/users
+curl -i http://127.0.0.1:9008/api/orders
+```
+
 ## Health and Resolution Rules
 
 - `register()` stores instance with status `UP` and heartbeat timestamp set to now.
@@ -97,6 +140,14 @@ Invalid status throws exception.
 - `deregister(string $name): bool`
 - `resolve(string $name): ?string`
 - `list(): array`
+
+Optional richer client methods (auto-used by `ServiceRegistry` when present):
+
+- `registerInstance(string $name, string $url, array $metadata = [], ?string $instanceId = null): bool`
+- `deregisterInstance(string $name, ?string $instanceId = null): bool`
+- `listInstances(string $name): array`
+- `heartbeat(string $name, ?string $instanceId = null): bool`
+- `setStatus(string $name, string $status, ?string $instanceId = null): bool`
 
 ## Heartbeat Timeout Configuration
 
