@@ -13,7 +13,8 @@ if test "$PHP_KISLAYPHP_DISCOVERY" != "no"; then
     CXXFLAGS="$CXXFLAGS -DKISLAYPHP_RPC"
     RPC_SRCS="../rpc/gen/discovery.pb.cc ../rpc/gen/discovery.grpc.pb.cc"
   else
-    AC_MSG_ERROR([RPC stubs not found. Run ./scripts/generate_rpc_stubs.sh])
+    AC_MSG_WARN([RPC stubs not found. Building without RPC support.])
+    RPC_SRCS=""
   fi
 
   PHP_NEW_EXTENSION(kislayphp_discovery, kislayphp_discovery.cpp $RPC_SRCS, $ext_shared)
