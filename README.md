@@ -98,6 +98,24 @@ curl -i http://127.0.0.1:9008/api/users
 curl -i http://127.0.0.1:9008/api/orders
 ```
 
+## Website Backend Example (4 Services)
+
+For a complete content backend with separate services (`docs`, `blog`, `community`, `auth`) routed through gateway:
+
+```bash
+cd examples/website_backend
+./start.sh
+./smoke_test.sh
+```
+
+Gateway entrypoint: `http://127.0.0.1:9008`
+
+Stop all services:
+
+```bash
+./stop.sh
+```
+
 ## Health and Resolution Rules
 
 - `register()` stores instance with status `UP` and heartbeat timestamp set to now.

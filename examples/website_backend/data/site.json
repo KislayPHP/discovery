@@ -1,0 +1,146 @@
+{
+  "home": {
+    "headline": "KislayPHP - High performance backend for APIs and microservices",
+    "subheadline": "Build modular services with native extensions for core, discovery, gateway, queue, metrics, config and event bus.",
+    "cta": {
+      "primary": "Get Started",
+      "secondary": "View Docs"
+    },
+    "highlights": [
+      "Extension-first performance",
+      "Simple routing and middleware",
+      "Service registry and gateway",
+      "Production-focused observability"
+    ]
+  },
+  "blog": {
+    "categories": [
+      "All",
+      "Release",
+      "Tutorial",
+      "Architecture"
+    ],
+    "posts": [
+      {
+        "id": "post-001",
+        "title": "Building your first KislayPHP API",
+        "category": "Tutorial",
+        "author": "Kislay Team",
+        "publishedAt": "2026-02-10",
+        "excerpt": "Create a service with routes, middleware and JSON responses in minutes.",
+        "slug": "first-kislay-api"
+      },
+      {
+        "id": "post-002",
+        "title": "Gateway and Discovery in one machine",
+        "category": "Architecture",
+        "author": "Kislay Team",
+        "publishedAt": "2026-02-12",
+        "excerpt": "How to route traffic through gateway while services self-register with discovery.",
+        "slug": "gateway-discovery-single-node"
+      },
+      {
+        "id": "post-003",
+        "title": "Version line reset to 0.0.x",
+        "category": "Release",
+        "author": "Kislay Team",
+        "publishedAt": "2026-02-15",
+        "excerpt": "Stabilization phase before 1.0 with compatibility and deployment improvements.",
+        "slug": "version-line-0-0-x"
+      }
+    ]
+  },
+  "community": {
+    "stats": [
+      {"label": "GitHub Repositories", "value": "7+"},
+      {"label": "Active Contributors", "value": "20+"},
+      {"label": "Package Installs", "value": "Growing"}
+    ],
+    "topContributors": [
+      {"name": "Kislay Raj", "focus": "Core Architecture"},
+      {"name": "Community Maintainers", "focus": "Examples and Docs"}
+    ],
+    "upcomingEvents": [
+      {"title": "Weekly Community Call", "date": "2026-02-28", "mode": "Online"},
+      {"title": "Microservices Workshop", "date": "2026-03-07", "mode": "Online"}
+    ],
+    "forumTopics": [
+      "NTS vs ZTS configuration",
+      "Gateway rate limiting patterns",
+      "Service-to-service communication"
+    ]
+  },
+  "kislayPhp": {
+    "hero": {
+      "title": "KislayPHP",
+      "description": "A modular backend platform for fast API development in PHP."
+    },
+    "quickInstall": [
+      "pie install kislayphp/core",
+      "pie install kislayphp/discovery",
+      "pie install kislayphp/gateway"
+    ],
+    "codeExample": "<?php\n$app = new Kislay\\Core\\App();\n$app->get('/health', fn($req, $res) => $res->json(['ok' => true], 200));\n$app->listen('0.0.0.0', 9008);",
+    "featureTabs": [
+      {"name": "Core", "description": "Routing, middleware, HTTP lifecycle"},
+      {"name": "Discovery", "description": "Service registration and health"},
+      {"name": "Gateway", "description": "Edge routing for distributed services"}
+    ],
+    "repos": [
+      "kislayphp",
+      "kislayphp_discovery",
+      "kislayphp_gateway",
+      "kislayphp_queue",
+      "kislayphp_metrics",
+      "kislayphp_config",
+      "kislayphp_eventbus"
+    ]
+  },
+  "docs": {
+    "sections": [
+      {
+        "title": "Installation",
+        "items": [
+          "Install extensions with PIE",
+          "Enable .so modules in php.ini",
+          "Verify with php -m"
+        ]
+      },
+      {
+        "title": "Core Routing",
+        "items": [
+          "Define GET/POST routes",
+          "Use middleware for auth and headers",
+          "Return JSON responses"
+        ]
+      },
+      {
+        "title": "Distributed Runtime",
+        "items": [
+          "Run registry separately",
+          "Register each service with heartbeat",
+          "Expose a single gateway endpoint"
+        ]
+      }
+    ]
+  },
+  "resources": {
+    "tutorials": [
+      {"title": "Start with core", "url": "https://github.com/KislayPHP"},
+      {"title": "Discovery setup", "url": "https://github.com/KislayPHP"}
+    ],
+    "examples": [
+      {"title": "Standalone registry", "path": "examples/standalone_registry"},
+      {"title": "Website backend", "path": "examples/website_backend"}
+    ],
+    "videos": [
+      {"title": "KislayPHP architecture overview", "platform": "YouTube"}
+    ],
+    "tools": [
+      "PHP 8.3+",
+      "PIE",
+      "Nginx",
+      "AWS EC2"
+    ]
+  }
+}

@@ -73,5 +73,9 @@ curl -i http://127.0.0.1:9008/api/orders
 ## Notes
 
 - `gateway_example.php` intentionally uses `setResolver(...)` and `addServiceRoute(...)` to map logical service names to real URLs from registry.
+- Resolver now uses cached/optional fallback target instead of throwing, so temporary registry misses do not crash gateway.
+- Optional fallback target: `GATEWAY_FALLBACK_TARGET=http://127.0.0.1:9101`
 - On NTS PHP builds, `setThreads(4)` in gateway will auto-fallback to `1` with warning.
 - For real deployment, set `SERVICE_URL` to the actual reachable host/IP for each service.
+
+For a full content platform example with 4 services (`docs`, `blog`, `community`, `auth`), use `../website_backend/`.

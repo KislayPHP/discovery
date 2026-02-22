@@ -16,6 +16,7 @@ if ($gatewayClass === null) {
 $registryUrl = getenv('REGISTRY_URL') ?: 'http://127.0.0.1:9090';
 $gatewayHost = getenv('GATEWAY_HOST') ?: '0.0.0.0';
 $gatewayPort = (int) (getenv('GATEWAY_PORT') ?: '9008');
+$fallbackTarget = trim((string) (getenv('GATEWAY_FALLBACK_TARGET') ?: ''));
 if ($gatewayPort < 1 || $gatewayPort > 65535) {
     $gatewayPort = 9008;
 }
@@ -29,12 +30,23 @@ $gateway->addServiceRoute('GET', '/api/users', 'user-service');
 $gateway->addServiceRoute('GET', '/api/orders', 'order-service');
 $gateway->addServiceRoute('GET', '/api/payments', 'payment-service');
 
-$gateway->setResolver(static function (string $service, string $method, string $path) use ($client): string {
+$resolvedCache = [];
+$gateway->setResolver(static function (string $service, string $method, string $path) use ($client, &$resolvedCache, $fallbackTarget): string {
     $url = $client->resolve($service);
-    if (!is_string($url) || $url === '') {
-        throw new RuntimeException('service not found in registry: ' . $service);
+    if (is_string($url) && $url !== '') {
+        $resolvedCache[$service] = $url;
+        return $url;
     }
-    return $url;
+
+    if (isset($resolvedCache[$service]) && is_string($resolvedCache[$service]) && $resolvedCache[$service] !== '') {
+        return $resolvedCache[$service];
+    }
+
+    if ($fallbackTarget !== '') {
+        return $fallbackTarget;
+    }
+
+    return '';
 });
 
 $gateway->listen($gatewayHost, $gatewayPort);
