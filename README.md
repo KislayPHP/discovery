@@ -55,6 +55,11 @@ $instances = $registry->listInstances('user-service');
 var_dump($url, $instances);
 ```
 
+## Documentation
+
+- [Class Reference](CLASS_REFERENCE.md)
+- [Deployment Guide (Docker/AWS/Cloud/On-Prem)](https://github.com/KislayPHP/core/blob/main/docs/DEPLOYMENT_GUIDE_MULTI_ENV.md)
+
 ## Standalone Service Registry
 
 You can run `ServiceRegistry` as a separate process and let services register themselves remotely.
