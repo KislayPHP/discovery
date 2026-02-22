@@ -57,8 +57,9 @@ var_dump($url, $instances);
 
 ## Documentation
 
-- [Class Reference](CLASS_REFERENCE.md)
-- [Deployment Guide (Docker/AWS/Cloud/On-Prem)](https://github.com/KislayPHP/core/blob/main/docs/DEPLOYMENT_GUIDE_MULTI_ENV.md)
+- Basic docs remain in this repository.
+- Full detailed docs are maintained on the site: [https://skelves.com/docs](https://skelves.com/docs)
+- Local docs route: `http://localhost:5180/docs`
 
 ## Standalone Service Registry
 
