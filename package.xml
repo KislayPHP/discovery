@@ -14,17 +14,17 @@
     <email>kislayraj.89@gmail.com</email>
     <active>yes</active>
   </lead>
-  <date>2026-02-21</date>
+  <date>2026-02-28</date>
   <version>
-    <release>0.0.1</release>
-    <api>0.0.1</api>
+    <release>0.0.3</release>
+    <api>0.0.3</api>
   </version>
   <stability>
     <release>beta</release>
     <api>beta</api>
   </stability>
   <license>Apache-2.0</license>
-  <notes>Added Kislay namespace support with compatibility aliases, heartbeat timeout control, and healthy-instance-only resolution behavior.</notes>
+  <notes>Standalone PIE build fix: removed civetweb hard dependency for health checks and kept RPC stubs optional so install does not fail when RPC assets are absent.</notes>
   <contents>
     <dir name="/">
       <file name="config.m4" role="src" />

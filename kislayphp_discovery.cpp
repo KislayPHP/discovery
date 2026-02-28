@@ -10,6 +10,7 @@ extern "C" {
 
 #include <chrono>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <pthread.h>
 #include <cstdlib>
@@ -18,7 +19,13 @@ extern "C" {
 #include <unordered_map>
 #include <vector>
 #include <atomic>
-#include <civetweb.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <netdb.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
 
 #ifdef KISLAYPHP_RPC
 #include <grpcpp/grpcpp.h>
@@ -51,6 +58,7 @@ struct _php_kislayphp_discovery_t {
     
     std::atomic<bool> health_check_active;
     pthread_t health_check_thread;
+    bool health_check_thread_started;
     zend_long health_check_interval_ms;
     
     zend_object std;
@@ -139,6 +147,212 @@ static long long kislayphp_now_ms() {
     return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
+struct kislayphp_parsed_url_t {
+    std::string scheme;
+    std::string host;
+    int port;
+    std::string path;
+};
+
+static bool kislayphp_parse_url(const std::string &input, kislayphp_parsed_url_t *out) {
+    if (out == nullptr) {
+        return false;
+    }
+
+    std::string url = input;
+    if (url.empty()) {
+        return false;
+    }
+
+    size_t scheme_sep = url.find("://");
+    if (scheme_sep == std::string::npos) {
+        return false;
+    }
+
+    out->scheme = url.substr(0, scheme_sep);
+    std::string rest = url.substr(scheme_sep + 3);
+
+    size_t slash = rest.find('/');
+    std::string authority = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+    out->path = (slash == std::string::npos) ? "/" : rest.substr(slash);
+    if (out->path.empty()) {
+        out->path = "/";
+    }
+
+    if (authority.empty()) {
+        return false;
+    }
+
+    size_t colon = authority.rfind(':');
+    if (colon != std::string::npos) {
+        out->host = authority.substr(0, colon);
+        const std::string port_str = authority.substr(colon + 1);
+        if (port_str.empty()) {
+            return false;
+        }
+        out->port = std::atoi(port_str.c_str());
+        if (out->port <= 0 || out->port > 65535) {
+            return false;
+        }
+    } else {
+        out->host = authority;
+        out->port = (out->scheme == "https") ? 443 : 80;
+    }
+
+    return !out->host.empty();
+}
+
+static int kislayphp_connect_with_timeout(const std::string &host, int port, int timeout_ms) {
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+
+    char port_buf[16];
+    std::snprintf(port_buf, sizeof(port_buf), "%d", port);
+
+    struct addrinfo *res = nullptr;
+    if (getaddrinfo(host.c_str(), port_buf, &hints, &res) != 0 || res == nullptr) {
+        return -1;
+    }
+
+    int socket_fd = -1;
+    for (struct addrinfo *ai = res; ai != nullptr; ai = ai->ai_next) {
+        socket_fd = static_cast<int>(socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol));
+        if (socket_fd < 0) {
+            continue;
+        }
+
+        const int old_flags = fcntl(socket_fd, F_GETFL, 0);
+        if (old_flags < 0) {
+            close(socket_fd);
+            socket_fd = -1;
+            continue;
+        }
+        if (fcntl(socket_fd, F_SETFL, old_flags | O_NONBLOCK) != 0) {
+            close(socket_fd);
+            socket_fd = -1;
+            continue;
+        }
+
+        int rc = connect(socket_fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc == 0) {
+            fcntl(socket_fd, F_SETFL, old_flags);
+            break;
+        }
+        if (errno != EINPROGRESS) {
+            close(socket_fd);
+            socket_fd = -1;
+            continue;
+        }
+
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(socket_fd, &wfds);
+
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+        rc = select(socket_fd + 1, nullptr, &wfds, nullptr, &tv);
+        if (rc > 0 && FD_ISSET(socket_fd, &wfds)) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            if (getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
+                fcntl(socket_fd, F_SETFL, old_flags);
+                break;
+            }
+        }
+
+        close(socket_fd);
+        socket_fd = -1;
+    }
+
+    freeaddrinfo(res);
+    return socket_fd;
+}
+
+static bool kislayphp_send_all(int socket_fd, const char *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(socket_fd, data + sent, len - sent, 0);
+        if (n <= 0) {
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool kislayphp_http_health_check(const ServiceInstance &inst) {
+    std::string target_url = inst.url;
+    if (!inst.health_check_url.empty()) {
+        if (inst.health_check_url.rfind("http://", 0) == 0 || inst.health_check_url.rfind("https://", 0) == 0) {
+            target_url = inst.health_check_url;
+        } else {
+            std::string base = inst.url;
+            if (!base.empty() && base.back() == '/' && inst.health_check_url.front() == '/') {
+                target_url = base.substr(0, base.size() - 1) + inst.health_check_url;
+            } else if (!base.empty() && base.back() != '/' && inst.health_check_url.front() != '/') {
+                target_url = base + "/" + inst.health_check_url;
+            } else {
+                target_url = base + inst.health_check_url;
+            }
+        }
+    }
+
+    kislayphp_parsed_url_t parsed;
+    if (!kislayphp_parse_url(target_url, &parsed)) {
+        return false;
+    }
+
+    const int timeout_ms = 2000;
+    int socket_fd = kislayphp_connect_with_timeout(parsed.host, parsed.port, timeout_ms);
+    if (socket_fd < 0) {
+        return false;
+    }
+
+    if (parsed.scheme == "https") {
+        close(socket_fd);
+        return true;
+    }
+
+    char request[2048];
+    std::snprintf(
+        request,
+        sizeof(request),
+        "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+        parsed.path.c_str(),
+        parsed.host.c_str());
+
+    const bool sent = kislayphp_send_all(socket_fd, request, std::strlen(request));
+    if (!sent) {
+        close(socket_fd);
+        return false;
+    }
+
+    char response[256];
+    const ssize_t n = recv(socket_fd, response, sizeof(response) - 1, 0);
+    close(socket_fd);
+    if (n <= 0) {
+        return false;
+    }
+    response[n] = '\0';
+
+    const char *prefix = "HTTP/";
+    if (std::strncmp(response, prefix, std::strlen(prefix)) != 0) {
+        return false;
+    }
+
+    const char *sp = std::strchr(response, ' ');
+    if (sp == nullptr || std::strlen(sp) < 4) {
+        return false;
+    }
+
+    int status = std::atoi(sp + 1);
+    return status >= 200 && status < 300;
+}
+
 static void *kislayphp_discovery_health_check_loop(void *arg) {
     php_kislayphp_discovery_t *obj = static_cast<php_kislayphp_discovery_t *>(arg);
     
@@ -162,39 +376,7 @@ static void *kislayphp_discovery_health_check_loop(void *arg) {
         pthread_mutex_unlock(&obj->lock);
         
         for (const auto &inst : to_check) {
-            char error_buf[256];
-            std::string host = inst.url;
-            bool use_tls = false;
-            if (host.find("https://") == 0) {
-                host = host.substr(8);
-                use_tls = true;
-            } else if (host.find("http://") == 0) {
-                host = host.substr(7);
-            }
-            
-            size_t slash = host.find('/');
-            if (slash != std::string::npos) host = host.substr(0, slash);
-            
-            int port = use_tls ? 443 : 80;
-            size_t colon = host.find(':');
-            if (colon != std::string::npos) {
-                port = std::atoi(host.substr(colon + 1).c_str());
-                host = host.substr(0, colon);
-            }
-            
-            struct mg_connection *conn = mg_connect_client(host.c_str(), port, use_tls ? 1 : 0, error_buf, sizeof(error_buf));
-            bool healthy = false;
-            if (conn) {
-                mg_printf(conn, "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", inst.health_check_url.c_str(), host.c_str());
-                if (mg_get_response(conn, error_buf, sizeof(error_buf), 2000) >= 0) {
-                    const struct mg_response_info *ri = mg_get_response_info(conn);
-                    if (ri && ri->status_code >= 200 && ri->status_code < 300) {
-                        healthy = true;
-                    }
-                }
-                mg_close_connection(conn);
-            }
-            
+            const bool healthy = kislayphp_http_health_check(inst);
             pthread_mutex_lock(&obj->lock);
             auto sit = obj->instances.find(inst.service_name);
             if (sit != obj->instances.end()) {
@@ -231,7 +413,12 @@ static zend_object *kislayphp_discovery_create_object(zend_class_entry *ce) {
     obj->heartbeat_timeout_ms = kislayphp_env_long("KISLAY_DISCOVERY_HEARTBEAT_TIMEOUT", 30000);
     obj->health_check_interval_ms = kislayphp_env_long("KISLAY_DISCOVERY_HEALTH_CHECK_INTERVAL", 10000);
     obj->health_check_active = true;
-    pthread_create(&obj->health_check_thread, nullptr, kislayphp_discovery_health_check_loop, obj);
+    obj->health_check_thread_started =
+        (pthread_create(&obj->health_check_thread, nullptr, kislayphp_discovery_health_check_loop, obj) == 0);
+    if (!obj->health_check_thread_started) {
+        obj->health_check_active = false;
+        php_error_docref(nullptr, E_WARNING, "Failed to start discovery health check thread");
+    }
     
     obj->std.handlers = zend_get_std_object_handlers();
     return &obj->std;
@@ -240,7 +427,9 @@ static zend_object *kislayphp_discovery_create_object(zend_class_entry *ce) {
 static void kislayphp_discovery_free_obj(zend_object *object) {
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(object);
     obj->health_check_active = false;
-    pthread_join(obj->health_check_thread, nullptr);
+    if (obj->health_check_thread_started) {
+        pthread_join(obj->health_check_thread, nullptr);
+    }
     if (obj->has_bus) zval_ptr_dtor(&obj->bus);
     if (obj->has_client) zval_ptr_dtor(&obj->client);
     obj->rr_index.~unordered_map();

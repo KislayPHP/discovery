@@ -33,7 +33,7 @@ Install from PIE:
 
 ```bash
 pie install kislayphp/core
-pie install kislayphp/discovery
+pie install kislayphp/discovery:0.0.3
 pie install kislayphp/gateway
 ```
 
