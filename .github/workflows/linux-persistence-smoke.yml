@@ -1,0 +1,113 @@
+name: Linux Persistence Smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "examples/website_backend/**"
+      - ".github/workflows/linux-persistence-smoke.yml"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout discovery
+        uses: actions/checkout@v4
+
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          tools: phpize
+          extensions: pdo_sqlite, sqlite3, curl
+          coverage: none
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y autoconf automake build-essential pkg-config libssl-dev libcurl4-openssl-dev
+
+      - name: Build core, gateway, and persistence extensions
+        run: |
+          set -euo pipefail
+
+          git clone --depth=1 https://github.com/KislayPHP/core.git /tmp/kislay-core
+          git clone --depth=1 https://github.com/KislayPHP/gateway.git /tmp/kislay-gateway
+          git clone --depth=1 https://github.com/KislayPHP/persistence.git /tmp/kislay-persistence
+
+          build_ext() {
+            local src="$1"
+            local configure_flag="$2"
+            pushd "$src" >/dev/null
+            phpize
+            ./configure "$configure_flag"
+            make -j"$(nproc)"
+            popd >/dev/null
+          }
+
+          build_ext /tmp/kislay-core --enable-kislayphp_extension
+          build_ext /tmp/kislay-gateway --enable-kislayphp_gateway
+          build_ext /tmp/kislay-persistence --enable-kislayphp_persistence
+
+      - name: Build discovery extension (current repository)
+        run: |
+          set -euo pipefail
+          phpize
+          ./configure --enable-kislayphp_discovery
+          make -j"$(nproc)"
+
+      - name: Run distributed website backend smoke with persistence
+        run: |
+          set -euo pipefail
+
+          CORE_SO=/tmp/kislay-core/modules/kislayphp_extension.so
+          DISCOVERY_SO="$GITHUB_WORKSPACE/modules/kislayphp_discovery.so"
+          GATEWAY_SO=/tmp/kislay-gateway/modules/kislayphp_gateway.so
+          PERSISTENCE_SO=/tmp/kislay-persistence/modules/kislayphp_persistence.so
+
+          test -f "$CORE_SO"
+          test -f "$DISCOVERY_SO"
+          test -f "$GATEWAY_SO"
+          test -f "$PERSISTENCE_SO"
+
+          PHP_BIN="php -n -dextension=${CORE_SO} -dextension=${DISCOVERY_SO} -dextension=${GATEWAY_SO} -dextension=${PERSISTENCE_SO}"
+
+          pushd examples/website_backend >/dev/null
+          cleanup() {
+            ./stop.sh >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          REGISTRY_PORT=19090 \
+          GATEWAY_PORT=19008 \
+          DOCS_SERVICE_PORT=19101 \
+          BLOG_SERVICE_PORT=19102 \
+          COMMUNITY_SERVICE_PORT=19103 \
+          AUTH_SERVICE_PORT=19104 \
+          SITE_STORAGE_DIR="$PWD/data/storage_ci" \
+          KISLAY_USE_PERSISTENCE=1 \
+          PHP_BIN="$PHP_BIN" \
+          ./start.sh
+
+          GATEWAY_PORT=19008 ./smoke_test.sh
+
+          AUTH_HEALTH="$(curl -fsS http://127.0.0.1:19104/health)"
+          echo "$AUTH_HEALTH"
+
+          AUTH_HEALTH_JSON="$AUTH_HEALTH" php -r '
+            $d = json_decode(getenv("AUTH_HEALTH_JSON"), true);
+            if (!is_array($d)) { fwrite(STDERR, "invalid auth health json\n"); exit(1); }
+            if (($d["authStorage"] ?? "") !== "sqlite+persistence") {
+              fwrite(STDERR, "expected authStorage=sqlite+persistence\n");
+              exit(1);
+            }
+            if (($d["persistenceConnected"] ?? false) !== true) {
+              fwrite(STDERR, "expected persistenceConnected=true\n");
+              exit(1);
+            }
+          '
+
+          popd >/dev/null
