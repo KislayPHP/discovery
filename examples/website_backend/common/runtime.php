@@ -32,6 +32,107 @@ function kislay_runtime_registry_class(): string {
     throw new RuntimeException('ServiceRegistry class not found. Load kislayphp_discovery.');
 }
 
+function kislay_runtime_persistence_db_class(): ?string {
+    if (class_exists('Kislay\\Persistence\\DB')) {
+        return 'Kislay\\Persistence\\DB';
+    }
+    if (class_exists('KislayPHP\\Persistence\\DB')) {
+        return 'KislayPHP\\Persistence\\DB';
+    }
+    return null;
+}
+
+function kislay_runtime_env_bool(string $key, bool $default = false): bool {
+    $raw = getenv($key);
+    if ($raw === false) {
+        return $default;
+    }
+
+    $value = strtolower(trim((string) $raw));
+    if ($value === '') {
+        return $default;
+    }
+    if (in_array($value, ['1', 'true', 'on', 'yes'], true)) {
+        return true;
+    }
+    if (in_array($value, ['0', 'false', 'off', 'no'], true)) {
+        return false;
+    }
+
+    return $default;
+}
+
+function kislay_runtime_open_sqlite(
+    string $path,
+    ?object $app = null,
+    bool &$persistenceConnected = false,
+    bool &$persistenceAttached = false
+): ?PDO {
+    $persistenceConnected = false;
+    $persistenceAttached = false;
+
+    $dir = dirname($path);
+    if ($dir !== '' && !is_dir($dir)) {
+        @mkdir($dir, 0775, true);
+    }
+
+    $usePersistence = kislay_runtime_env_bool('KISLAY_USE_PERSISTENCE', true);
+    $dbClass = $usePersistence ? kislay_runtime_persistence_db_class() : null;
+
+    if ($usePersistence && is_string($dbClass) && $dbClass !== '') {
+        try {
+            $dbClass::boot([
+                'default' => 'site',
+                'connections' => [
+                    'site' => [
+                        'driver' => 'sqlite',
+                        'database' => $path,
+                    ],
+                ],
+            ]);
+
+            $pdo = $dbClass::connection('site');
+            if ($pdo instanceof PDO) {
+                $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+                $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+                $pdo->exec('PRAGMA journal_mode = WAL;');
+                $pdo->exec('PRAGMA synchronous = NORMAL;');
+                $persistenceConnected = true;
+
+                if ($app !== null) {
+                    if (method_exists($app, 'onRequestStart') && method_exists($app, 'onRequestEnd')) {
+                        try {
+                            $persistenceAttached = ($dbClass::attach($app) === true);
+                        } catch (Throwable $e) {
+                            fwrite(STDERR, "warning: persistence attach failed, continuing: {$e->getMessage()}\n");
+                        }
+                    } else {
+                        fwrite(STDERR, "warning: persistence attach skipped; app lifecycle hooks unavailable\n");
+                    }
+                }
+
+                return $pdo;
+            }
+        } catch (Throwable $e) {
+            fwrite(STDERR, "warning: persistence sqlite open failed, falling back to PDO: {$e->getMessage()}\n");
+        }
+    } elseif ($usePersistence) {
+        fwrite(STDERR, "warning: KISLAY_USE_PERSISTENCE enabled but Kislay\\\\Persistence\\\\DB class is unavailable\n");
+    }
+
+    try {
+        $pdo = new PDO('sqlite:' . $path);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+        $pdo->exec('PRAGMA journal_mode = WAL;');
+        $pdo->exec('PRAGMA synchronous = NORMAL;');
+        return $pdo;
+    } catch (Throwable $e) {
+        fwrite(STDERR, "warning: sqlite open failed, switching to memory auth state: {$e->getMessage()}\n");
+        return null;
+    }
+}
+
 function kislay_runtime_read_json($req): array {
     if (is_object($req) && method_exists($req, 'getJson')) {
         try {
