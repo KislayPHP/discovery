@@ -606,6 +606,12 @@ zend_module_entry kislayphp_discovery_module_entry = {
     STANDARD_MODULE_PROPERTIES
 };
 
-#ifdef COMPILE_DL_KISLAYPHP_DISCOVERY
-extern "C" { ZEND_GET_MODULE(kislayphp_discovery) }
+#ifdef ZTS
+ZEND_TSRMLS_CACHE_DEFINE();
 #endif
+
+extern "C" {
+ZEND_DLEXPORT zend_module_entry *get_module(void) {
+    return &kislayphp_discovery_module_entry;
+}
+}

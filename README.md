@@ -4,7 +4,7 @@ PHP extension for service registration and discovery with instance-level health 
 
 ## Version
 
-Current package line: `v0.0.3`.
+Current package line: `v0.0.4`.
 
 ## Namespace
 
@@ -20,7 +20,7 @@ Current package line: `v0.0.3`.
 Via PIE:
 
 ```bash
-pie install kislayphp/discovery:0.0.3
+pie install kislayphp/discovery:0.0.4
 ```
 
 Enable in `php.ini`:

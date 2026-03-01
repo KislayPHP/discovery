@@ -34,7 +34,7 @@ Install from PIE:
 
 ```bash
 pie install kislayphp/core
-pie install kislayphp/discovery:0.0.3
+pie install kislayphp/discovery:0.0.4
 pie install kislayphp/gateway
 pie install kislayphp/persistence:0.0.1
 ```
