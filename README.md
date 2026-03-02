@@ -2,6 +2,12 @@
 
 PHP extension for service registration and discovery with instance-level health state.
 
+## Concurrency Mode
+
+- Default API mode is synchronous.
+- Registry operations (`register`, `resolve`, `listInstances`, heartbeat/status updates) return immediate values.
+- Use core async clients (for example `Kislay\Core\AsyncHttp`) for non-blocking inter-service HTTP calls.
+
 ## Version
 
 Current package line: `v0.0.4`.
@@ -58,8 +64,8 @@ var_dump($url, $instances);
 ## Documentation
 
 - Basic docs remain in this repository.
-- Full detailed docs are maintained on the site: [https://skelves.com/docs](https://skelves.com/docs)
-- Local docs route: `http://localhost:5180/docs`
+- Full detailed docs are maintained on the site: [https://skelves.com/kislayphp/docs](https://skelves.com/kislayphp/docs)
+- Local docs route: `http://localhost:5180/kislayphp/docs`
 
 ## Standalone Service Registry
 

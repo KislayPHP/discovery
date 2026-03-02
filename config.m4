@@ -3,6 +3,7 @@ PHP_ARG_ENABLE(kislayphp_discovery, whether to enable kislayphp_discovery,
 
 if test "$PHP_KISLAYPHP_DISCOVERY" != "no"; then
   PHP_REQUIRE_CXX()
+  PHP_ADD_LIBRARY(stdc++,, KISLAYPHP_DISCOVERY_SHARED_LIBADD)
   if test -f ../rpc/gen/discovery.pb.cc; then
     RPC_GEN_DIR=`pwd`/../rpc/gen
     PHP_ADD_INCLUDE($RPC_GEN_DIR)
@@ -18,4 +19,5 @@ if test "$PHP_KISLAYPHP_DISCOVERY" != "no"; then
   fi
 
   PHP_NEW_EXTENSION(kislayphp_discovery, kislayphp_discovery.cpp $RPC_SRCS, $ext_shared)
+  PHP_SUBST(KISLAYPHP_DISCOVERY_SHARED_LIBADD)
 fi

@@ -18,7 +18,7 @@ curl -fsS "$BASE/api/site/docs" >/dev/null
 
 echo "[smoke] POST /api/auth/login"
 LOGIN_JSON="$(curl -fsS -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' -d '{"email":"admin@skelves.com","password":"kislay123"}')"
-TOKEN="$(printf '%s' "$LOGIN_JSON" | php -r '$d=json_decode(stream_get_contents(STDIN), true); echo is_array($d) && isset($d["accessToken"]) ? $d["accessToken"] : "";')"
+TOKEN="$(printf '%s' "$LOGIN_JSON" | php -n -r '$d=json_decode(stream_get_contents(STDIN), true); echo is_array($d) && isset($d["accessToken"]) ? $d["accessToken"] : "";')"
 if [[ -z "$TOKEN" ]]; then
   echo "[smoke] auth token missing"
   exit 1
