@@ -16,15 +16,15 @@
   </lead>
   <date>2026-03-01</date>
   <version>
-    <release>0.0.4</release>
-    <api>0.0.4</api>
+    <release>0.0.5</release>
+    <api>0.0.5</api>
   </version>
   <stability>
     <release>beta</release>
     <api>beta</api>
   </stability>
   <license>Apache-2.0</license>
-  <notes>Release 0.0.4: always export get_module so PIE-built binaries load reliably across Linux targets.</notes>
+  <notes>Release 0.0.5.</notes>
   <contents>
     <dir name="/">
       <file name="config.m4" role="src" />
