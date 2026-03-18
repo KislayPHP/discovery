@@ -2,247 +2,138 @@
 
 ## Overview
 
-`kislayphp_discovery` provides service registry primitives for PHP applications, with instance metadata, status management, heartbeat tracking, and healthy-instance resolution.
+`kislayphp_discovery` is the service registry for KislayPHP.
 
-Namespace:
+Use it to:
+- register service instances
+- maintain heartbeat/status
+- resolve a healthy instance URL for Core `ServiceClient` or Gateway resolver code
+
+Keep it limited to resolution concerns.
+
+## Namespace
 
 - Primary: `Kislay\Discovery\ServiceRegistry`, `Kislay\Discovery\ClientInterface`
 - Legacy aliases: `KislayPHP\Discovery\ServiceRegistry`, `KislayPHP\Discovery\ClientInterface`
 
-## Class: `Kislay\Discovery\ServiceRegistry`
+## Public API
 
-### Constructor
+### `register(string $name, string $url, ?array $metadata = null, ?string $instanceId = null): bool`
+Registers one instance.
 
-```php
-new Kislay\Discovery\ServiceRegistry()
-```
+### `deregister(string $name, ?string $instanceId = null): bool`
+Removes one instance or the whole service entry.
 
-Loads heartbeat timeout from env:
+### `resolve(string $name, ?string $key = null): ?string`
+Returns one healthy URL.
 
-- `KISLAY_DISCOVERY_HEARTBEAT_TIMEOUT_MS` (default `90000`)
-- values `< 1000` are clamped to `1000` with warning
+### `resolveAll(string $name): array`
+Returns all healthy URLs ordered by effective weight.
 
-### `setClient`
+### `list(): array`
+Returns service => primary URL.
 
-```php
-setClient(Kislay\Discovery\ClientInterface $client): bool
-```
+### `listInstances(string $name): array`
+Returns full instance metadata.
 
-Sets external client adapter. Throws if object does not implement `ClientInterface`.
+### `heartbeat(string $name, ?string $instanceId = null): bool`
+Marks one/all matching instances `UP` and refreshes heartbeat.
 
-### `register`
-
-```php
-register(string $name, string $url, ?array $metadata = null, ?string $instanceId = null): bool
-```
-
-Registers local instance record:
-
-- `instanceId` defaults to `url` when omitted
-- status initialized to `UP`
-- heartbeat initialized to current timestamp
-- metadata stored as string map
-
-With external client set, method also calls `$client->register($name, $url)` and returns `false` if client returns `false`.
-
-### `deregister`
-
-```php
-deregister(string $name, ?string $instanceId = null): bool
-```
-
-Without external client:
-
-- with `instanceId`: removes only that instance
-- without `instanceId`: removes all instances under service
-
-With external client set:
-
-- delegates to `$client->deregister($name)`
-- returns `false` when client returns `false`
-
-### `list`
-
-```php
-list(): array
-```
-
-Returns service map.
-
-- With external client set: returns `$client->list()`.
-- Without client: returns local service => URL map.
-
-### `resolve`
-
-```php
-resolve(string $name): ?string
-```
-
-Resolution order:
-
-- With external client set: delegates to `$client->resolve($name)`.
-- With RPC mode enabled: attempts remote resolution.
-- Otherwise local resolution:
-  - If service has instances, picks healthy+fresh instance via round-robin.
-  - If no instance collection exists, may return fallback URL from service map.
-
-Healthy+fresh condition:
-
-- status is `UP`
-- `now_ms - lastHeartbeat <= heartbeat_timeout_ms`
-
-No valid candidate returns `null`.
-
-### `listInstances`
-
-```php
-listInstances(string $name): array
-```
-
-Returns local/RPC instance details for one service.
-
-Each item format:
-
-- `service`
-- `instanceId`
-- `url`
-- `status`
-- `lastHeartbeat` (ms epoch)
-- `metadata` (array)
-
-### `heartbeat`
-
-```php
-heartbeat(string $name, ?string $instanceId = null): bool
-```
-
-Updates heartbeat timestamp and forces status `UP`.
-
-- with `instanceId`: updates one instance
-- without `instanceId`: updates all instances in service
-
-Returns `true` if at least one instance was updated.
-
-### `setStatus`
-
-```php
-setStatus(string $name, string $status, ?string $instanceId = null): bool
-```
-
-Allowed status values:
-
+### `setStatus(string $name, string $status, ?string $instanceId = null): bool`
+Allowed statuses:
 - `UP`
 - `DOWN`
 - `OUT_OF_SERVICE`
 - `UNKNOWN`
 
-Status is normalized to uppercase before validation. Invalid status throws exception.
+### `setHeartbeatTimeout(int $milliseconds): bool`
+Controls stale pruning threshold.
 
-Returns `true` if at least one instance was updated.
+## Selection behavior
 
-### `setHeartbeatTimeout`
+Supported balancers:
+- `weighted_random` (default)
+- `random`
+- `round_robin`
+- `consistent_hash`
 
-```php
-setHeartbeatTimeout(int $milliseconds): bool
+Random selection now uses `std::mt19937`.
+
+## Freshness and pruning
+
+Instance is healthy only when:
+- status is `UP`
+- heartbeat age is within `heartbeat_timeout_ms`
+
+Stale entries are pruned lazily before local read paths:
+- `resolve`
+- `resolveAll`
+- `list`
+- `listInstances`
+- `getWeight`
+
+## Concurrency
+
+Registry state uses an RW lock instead of a single plain mutex.
+- writes: register, deregister, heartbeat, status updates, prune
+- reads: selection/list paths after synchronization work
+
+## Capacity protection
+
+`KISLAY_DISCOVERY_MAX_INSTANCES_PER_SERVICE`
+- defaults to `1024`
+- registration fails when the cap is exceeded
+- standalone HTTP `/register` returns `409`
+
+## Redis backend
+
+Enable with:
+
+```bash
+export KISLAY_DISCOVERY_STORAGE=redis
+export KISLAY_DISCOVERY_REDIS_HOST=127.0.0.1
+export KISLAY_DISCOVERY_REDIS_PORT=6379
+export KISLAY_DISCOVERY_REDIS_DB=0
+export KISLAY_DISCOVERY_REDIS_PREFIX=kislay:discovery
 ```
 
-Sets freshness threshold used by `resolve()`.
+Behavior:
+- local state remains as the safe fallback mirror
+- registry writes are pushed to Redis
+- registry reads synchronize from Redis when available
+- Redis failure falls back to in-memory state with warning
 
-- values `< 1000` are clamped to `1000` with warning.
+This keeps dependencies light while still allowing shared registry state.
 
-### `setBus`
-
-```php
-setBus(object $bus): bool
-```
-
-Stores bus object for event emission.
-
-Events emitted:
-
-- `discovery.register`
-- `discovery.deregister`
-
-Payload:
+## Standalone registry server
 
 ```php
-[
-  'name' => '<service-name>',
-  'url' => '<service-url>'
-]
+<?php
+
+$registry = new Kislay\Discovery\ServiceRegistry();
+$registry->listen('0.0.0.0', 9010);
+$registry->run();
 ```
 
-## Interface: `Kislay\Discovery\ClientInterface`
-
-Required methods:
-
-```php
-interface Kislay\Discovery\ClientInterface {
-    public function register(string $name, string $url): bool;
-    public function deregister(string $name): bool;
-    public function resolve(string $name): ?string;
-    public function list(): array;
-}
-```
-
-If your custom client class also defines richer methods below, `ServiceRegistry` will use them automatically:
-
-- `registerInstance(string $name, string $url, array $metadata = [], ?string $instanceId = null): bool`
-- `deregisterInstance(string $name, ?string $instanceId = null): bool`
-- `listInstances(string $name): array`
-- `heartbeat(string $name, ?string $instanceId = null): bool`
-- `setStatus(string $name, string $status, ?string $instanceId = null): bool`
-
-## Separate Registry Deployment
-
-Deploy discovery as a standalone process and use remote registration/resolution.
-
-Reference files:
-
-- `examples/standalone_registry/registry_server.php`
-- `examples/standalone_registry/HttpDiscoveryClient.php`
-- `examples/standalone_registry/service_example.php`
-- `examples/standalone_registry/gateway_example.php`
-
-### Registry API (from `registry_server.php`)
-
-- `POST /v1/register` body: `service`, `url`, optional `instanceId`, `metadata`
-- `POST /v1/deregister` body: `service`, optional `instanceId`
-- `POST /v1/heartbeat` body: `service`, optional `instanceId`
-- `POST /v1/status` body: `service`, `status`, optional `instanceId`
-- `GET /v1/resolve?service=<name>`
-- `GET /v1/services`
-- `GET /v1/instances?service=<name>`
+Standalone server exposes registry-only endpoints:
+- `POST /register`
+- `POST /deregister`
+- `POST /heartbeat`
+- `POST /status`
+- `GET /resolve?name=...`
+- `GET /resolve-all?name=...`
+- `GET /list`
+- `GET /instances?name=...`
 - `GET /health`
 
-### Service Self-registration Pattern
+## Core integration
 
-Service process startup:
+Expected consumer:
+- `Kislay\Core\ServiceClient`
 
-1. Create `HttpDiscoveryClient`
-2. Register service URL and instance ID
-3. Start service listener
-4. Send heartbeat periodically
-5. Deregister on shutdown
-
-### Gateway Consumption Pattern
-
-Gateway process startup:
-
-1. Add logical service routes with `addServiceRoute()`
-2. Use `setResolver()` callback
-3. Resolver calls remote registry (`resolve(service)`)
-4. Gateway proxies to returned URL
-
-## RPC Mode (Optional Build)
-
-If extension is compiled with RPC support, remote calls can be enabled via:
-
-- `KISLAY_RPC_ENABLED=1`
-- `KISLAY_RPC_DISCOVERY_ENDPOINT` (default `127.0.0.1:9090`)
-- `KISLAY_RPC_TIMEOUT_MS` (default `200`)
-
-RPC is used for supported methods when enabled.
+Discovery should hand back:
+- clean URL
+- instance metadata via `listInstances()` when needed
 
 ## Example
 
@@ -250,24 +141,8 @@ RPC is used for supported methods when enabled.
 <?php
 
 $registry = new Kislay\Discovery\ServiceRegistry();
-$registry->setHeartbeatTimeout(15000);
+$registry->register('billing', 'http://10.0.0.10:9000', ['zone' => 'az-1', 'weight' => '2'], 'billing-1');
+$registry->register('billing', 'http://10.0.0.11:9000', ['zone' => 'az-2', 'weight' => '1'], 'billing-2');
 
-$registry->register('billing', 'http://10.0.0.10:9000', ['zone' => 'az-1'], 'billing-1');
-$registry->register('billing', 'http://10.0.0.11:9000', ['zone' => 'az-2'], 'billing-2');
-
-echo $registry->resolve('billing') . PHP_EOL;
-
-$registry->setStatus('billing', 'DOWN', 'billing-1');
-$registry->heartbeat('billing', 'billing-2');
-
-print_r($registry->listInstances('billing'));
-```
-
-## Build and Test
-
-```bash
-phpize
-./configure --enable-kislayphp_discovery
-make
-make test
+echo $registry->resolve('billing'), PHP_EOL;
 ```

@@ -17,6 +17,7 @@ extern "C" {
 #include <ctime>
 #include <functional>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -25,14 +26,18 @@ extern "C" {
   #include <windows.h>
   #ifndef PTHREAD_WIN32_COMPAT
   #define PTHREAD_WIN32_COMPAT
-  typedef CRITICAL_SECTION pthread_mutex_t;
-  #define pthread_mutex_init(m, a)   InitializeCriticalSection(m)
-  #define pthread_mutex_destroy(m)   DeleteCriticalSection(m)
-  #define pthread_mutex_lock(m)      EnterCriticalSection(m)
-  #define pthread_mutex_unlock(m)    LeaveCriticalSection(m)
+  typedef SRWLOCK pthread_rwlock_t;
+  #define pthread_rwlock_init(l, a)  (InitializeSRWLock(l), 0)
+  #define pthread_rwlock_destroy(l)  ((void)0)
+  #define pthread_rwlock_rdlock(l)   AcquireSRWLockShared(l)
+  #define pthread_rwlock_wrlock(l)   AcquireSRWLockExclusive(l)
+  #define pthread_rwlock_unlock_rd(l) ReleaseSRWLockShared(l)
+  #define pthread_rwlock_unlock_wr(l) ReleaseSRWLockExclusive(l)
   #endif
 #else
   #include <pthread.h>
+  #define pthread_rwlock_unlock_rd(l) pthread_rwlock_unlock(l)
+  #define pthread_rwlock_unlock_wr(l) pthread_rwlock_unlock(l)
   #include <arpa/inet.h>
   #include <netdb.h>
   #include <netinet/in.h>
@@ -632,12 +637,21 @@ typedef struct _php_kislayphp_discovery_t {
     std::unordered_map<std::string, std::unordered_map<std::string, ServiceInstance>> instances;
     std::unordered_map<std::string, size_t> rr_index;
     std::string balancer_type;
-    pthread_mutex_t lock;
+    std::string storage_backend;
+    bool redis_enabled;
+    std::string redis_host;
+    zend_long redis_port;
+    zend_long redis_db;
+    zend_long redis_timeout_ms;
+    std::string redis_password;
+    std::string redis_prefix;
+    pthread_rwlock_t lock;
     zval bus;
     bool has_bus;
     zval client;
     bool has_client;
     zend_long heartbeat_timeout_ms;
+    zend_long max_instances_per_service;
     std::string remote_base_url;
     std::string listen_host;
     zend_long listen_port;
@@ -662,7 +676,24 @@ static zend_object *kislayphp_discovery_create_object(zend_class_entry *ce) {
     new (&obj->instances) std::unordered_map<std::string, std::unordered_map<std::string, php_kislayphp_discovery_t::ServiceInstance>>();
     new (&obj->rr_index) std::unordered_map<std::string, size_t>();
     new (&obj->balancer_type) std::string("weighted_random");
-    pthread_mutex_init(&obj->lock, nullptr);
+    new (&obj->storage_backend) std::string(kislayphp_env_string("KISLAY_DISCOVERY_STORAGE", "memory"));
+    obj->redis_enabled = obj->storage_backend == "redis";
+    new (&obj->redis_host) std::string(kislayphp_env_string("KISLAY_DISCOVERY_REDIS_HOST", "127.0.0.1"));
+    obj->redis_port = kislayphp_env_long("KISLAY_DISCOVERY_REDIS_PORT", 6379);
+    if (obj->redis_port < 1) {
+        obj->redis_port = 6379;
+    }
+    obj->redis_db = kislayphp_env_long("KISLAY_DISCOVERY_REDIS_DB", 0);
+    if (obj->redis_db < 0) {
+        obj->redis_db = 0;
+    }
+    obj->redis_timeout_ms = kislayphp_env_long("KISLAY_DISCOVERY_REDIS_TIMEOUT_MS", 200);
+    if (obj->redis_timeout_ms < 1) {
+        obj->redis_timeout_ms = 200;
+    }
+    new (&obj->redis_password) std::string(kislayphp_env_string("KISLAY_DISCOVERY_REDIS_PASSWORD", ""));
+    new (&obj->redis_prefix) std::string(kislayphp_env_string("KISLAY_DISCOVERY_REDIS_PREFIX", "kislay:discovery"));
+    pthread_rwlock_init(&obj->lock, nullptr);
     ZVAL_UNDEF(&obj->bus);
     obj->has_bus = false;
     ZVAL_UNDEF(&obj->client);
@@ -670,6 +701,10 @@ static zend_object *kislayphp_discovery_create_object(zend_class_entry *ce) {
     obj->heartbeat_timeout_ms = kislayphp_sanitize_heartbeat_timeout_ms(
         kislayphp_env_long("KISLAY_DISCOVERY_HEARTBEAT_TIMEOUT_MS", 90000),
         "Kislay\\Discovery\\ServiceRegistry::__construct");
+    obj->max_instances_per_service = kislayphp_env_long("KISLAY_DISCOVERY_MAX_INSTANCES_PER_SERVICE", 1024);
+    if (obj->max_instances_per_service < 1) {
+        obj->max_instances_per_service = 1024;
+    }
     new (&obj->remote_base_url) std::string();
     new (&obj->listen_host) std::string("127.0.0.1");
     obj->listen_port = 0;
@@ -687,13 +722,17 @@ static void kislayphp_discovery_free_obj(zend_object *object) {
     if (obj->has_client) {
         zval_ptr_dtor(&obj->client);
     }
+    obj->redis_prefix.~basic_string();
+    obj->redis_password.~basic_string();
+    obj->redis_host.~basic_string();
+    obj->storage_backend.~basic_string();
     obj->listen_host.~basic_string();
     obj->remote_base_url.~basic_string();
     obj->rr_index.~unordered_map();
     obj->balancer_type.~basic_string();
     obj->instances.~unordered_map();
     obj->services.~unordered_map();
-    pthread_mutex_destroy(&obj->lock);
+    pthread_rwlock_destroy(&obj->lock);
     zend_object_std_dtor(&obj->std);
 }
 
@@ -814,6 +853,55 @@ static bool kislayphp_call_object_method(zval *object,
     return call_result == SUCCESS;
 }
 
+static size_t kislayphp_random_index(size_t size) {
+    thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<size_t> dist(0, size - 1);
+    return dist(rng);
+}
+
+static bool kislayphp_discovery_prune_stale_locked(
+    php_kislayphp_discovery_t *obj,
+    const std::string *only_service,
+    std::vector<std::pair<std::string, std::string>> *stale_instances = nullptr) {
+    const long long now_ms = kislayphp_now_ms();
+    bool removed_any = false;
+
+    for (auto service_it = obj->instances.begin(); service_it != obj->instances.end();) {
+        if (only_service != nullptr && service_it->first != *only_service) {
+            ++service_it;
+            continue;
+        }
+
+        auto &service_instances = service_it->second;
+        for (auto inst_it = service_instances.begin(); inst_it != service_instances.end();) {
+            const auto &instance = inst_it->second;
+            const bool is_fresh = (now_ms - instance.last_heartbeat_ms) <= static_cast<long long>(obj->heartbeat_timeout_ms);
+            if (is_fresh) {
+                ++inst_it;
+                continue;
+            }
+
+            if (stale_instances != nullptr) {
+                stale_instances->push_back({service_it->first, instance.url});
+            }
+            inst_it = service_instances.erase(inst_it);
+            removed_any = true;
+        }
+
+        if (service_instances.empty()) {
+            obj->services.erase(service_it->first);
+            obj->rr_index.erase(service_it->first);
+            service_it = obj->instances.erase(service_it);
+            continue;
+        }
+
+        obj->services[service_it->first] = service_instances.begin()->second.url;
+        ++service_it;
+    }
+
+    return removed_any;
+}
+
 static bool kislayphp_select_healthy_instance(php_kislayphp_discovery_t *obj,
                                               const std::string &service,
                                               const std::string &hash_key,
@@ -854,7 +942,7 @@ static bool kislayphp_select_healthy_instance(php_kislayphp_discovery_t *obj,
     }
 
     if (balancer == "random") {
-        size_t idx = static_cast<size_t>(rand()) % healthy.size();
+        size_t idx = kislayphp_random_index(healthy.size());
         *selected = *healthy[idx];
         return true;
     }
@@ -863,10 +951,12 @@ static bool kislayphp_select_healthy_instance(php_kislayphp_discovery_t *obj,
     int total_weight = 0;
     for (const auto *inst : healthy) total_weight += inst->weight;
     if (total_weight <= 0) {
-        *selected = *healthy[static_cast<size_t>(rand()) % healthy.size()];
+        *selected = *healthy[kislayphp_random_index(healthy.size())];
         return true;
     }
-    int r = rand() % total_weight;
+    thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> dist(0, total_weight - 1);
+    int r = dist(rng);
     int cumulative = 0;
     for (const auto *inst : healthy) {
         cumulative += inst->weight;
@@ -942,7 +1032,44 @@ static void kislayphp_discovery_metadata_from_params(
     }
 }
 
-static void kislayphp_discovery_register_local(
+#ifndef _WIN32
+static std::string kislayphp_discovery_redis_services_key(php_kislayphp_discovery_t *obj);
+static std::string kislayphp_discovery_redis_instances_key(php_kislayphp_discovery_t *obj, const std::string &service);
+static bool kislayphp_discovery_instance_to_json(const php_kislayphp_discovery_t::ServiceInstance &instance,
+                                                 std::string *json_out,
+                                                 std::string *error_out);
+static bool kislayphp_discovery_redis_hget(php_kislayphp_discovery_t *obj,
+                                           const std::string &key,
+                                           const std::string &field,
+                                           std::string *value_out,
+                                           bool *exists_out,
+                                           std::string *error_out);
+static bool kislayphp_discovery_redis_hlen(php_kislayphp_discovery_t *obj,
+                                           const std::string &key,
+                                           long long *count_out,
+                                           std::string *error_out);
+static bool kislayphp_discovery_redis_simple_write(php_kislayphp_discovery_t *obj,
+                                                   const std::vector<std::string> &parts,
+                                                   std::string *error_out);
+static bool kislayphp_discovery_redis_sync_service(php_kislayphp_discovery_t *obj,
+                                                   const std::string &service,
+                                                   std::string *error_out);
+static bool kislayphp_discovery_redis_sync_all_services(php_kislayphp_discovery_t *obj,
+                                                        std::string *error_out);
+static void kislayphp_discovery_warn_redis_fallback(const std::string &error);
+#else
+static std::string kislayphp_discovery_redis_services_key(php_kislayphp_discovery_t *) { return ""; }
+static std::string kislayphp_discovery_redis_instances_key(php_kislayphp_discovery_t *, const std::string &) { return ""; }
+static bool kislayphp_discovery_instance_to_json(const php_kislayphp_discovery_t::ServiceInstance &, std::string *, std::string *) { return false; }
+static bool kislayphp_discovery_redis_hget(php_kislayphp_discovery_t *, const std::string &, const std::string &, std::string *, bool *, std::string *) { return false; }
+static bool kislayphp_discovery_redis_hlen(php_kislayphp_discovery_t *, const std::string &, long long *, std::string *) { return false; }
+static bool kislayphp_discovery_redis_simple_write(php_kislayphp_discovery_t *, const std::vector<std::string> &, std::string *) { return false; }
+static bool kislayphp_discovery_redis_sync_service(php_kislayphp_discovery_t *, const std::string &, std::string *) { return false; }
+static bool kislayphp_discovery_redis_sync_all_services(php_kislayphp_discovery_t *, std::string *) { return false; }
+static void kislayphp_discovery_warn_redis_fallback(const std::string &) {}
+#endif
+
+static bool kislayphp_discovery_register_local(
     php_kislayphp_discovery_t *obj,
     const std::string &service,
     const std::string &service_url,
@@ -954,7 +1081,36 @@ static void kislayphp_discovery_register_local(
         inst_weight = std::max(1, std::atoi(weight_it->second.c_str()));
     }
 
-    pthread_mutex_lock(&obj->lock);
+    if (obj->redis_enabled) {
+        std::string redis_error;
+        bool exists = false;
+        std::string existing_payload;
+        const std::string instances_key = kislayphp_discovery_redis_instances_key(obj, service);
+        if (kislayphp_discovery_redis_hget(obj, instances_key, instance, &existing_payload, &exists, &redis_error)) {
+            if (!exists) {
+                long long instance_count = 0;
+                if (kislayphp_discovery_redis_hlen(obj, instances_key, &instance_count, &redis_error)
+                    && instance_count >= obj->max_instances_per_service) {
+                    return false;
+                }
+            }
+        } else {
+            kislayphp_discovery_warn_redis_fallback(redis_error);
+        }
+    }
+
+    std::vector<std::pair<std::string, std::string>> stale_instances;
+    pthread_rwlock_wrlock(&obj->lock);
+    kislayphp_discovery_prune_stale_locked(obj, &service, &stale_instances);
+    auto &service_instances = obj->instances[service];
+    if (service_instances.find(instance) == service_instances.end()
+        && service_instances.size() >= static_cast<size_t>(obj->max_instances_per_service)) {
+        pthread_rwlock_unlock_wr(&obj->lock);
+        for (const auto &stale : stale_instances) {
+            kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
+        }
+        return false;
+    }
     php_kislayphp_discovery_t::ServiceInstance record;
     record.service_name = service;
     record.instance_id = instance;
@@ -963,9 +1119,23 @@ static void kislayphp_discovery_register_local(
     record.metadata = metadata;
     record.weight = inst_weight;
     record.last_heartbeat_ms = kislayphp_now_ms();
-    obj->instances[service][instance] = record;
+    service_instances[instance] = record;
     obj->services[service] = service_url;
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
+    for (const auto &stale : stale_instances) {
+        kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
+    }
+
+    if (obj->redis_enabled) {
+        std::string redis_error;
+        std::string payload_json;
+        if (!kislayphp_discovery_instance_to_json(record, &payload_json, &redis_error)
+            || !kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_instances_key(obj, service), instance, payload_json}, &redis_error)
+            || !kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_services_key(obj), service, service_url}, &redis_error)) {
+            kislayphp_discovery_warn_redis_fallback(redis_error);
+        }
+    }
+    return true;
 }
 
 static bool kislayphp_discovery_deregister_local(
@@ -975,7 +1145,32 @@ static bool kislayphp_discovery_deregister_local(
     std::string *removed_url = nullptr) {
     std::string url;
 
-    pthread_mutex_lock(&obj->lock);
+    if (obj->redis_enabled) {
+        std::string redis_error;
+        if (!instance_id.empty()) {
+            if (!kislayphp_discovery_redis_simple_write(obj,
+                                                        {"HDEL", kislayphp_discovery_redis_instances_key(obj, service), instance_id},
+                                                        &redis_error)) {
+                kislayphp_discovery_warn_redis_fallback(redis_error);
+            } else {
+                long long remaining = 0;
+                if (kislayphp_discovery_redis_hlen(obj, kislayphp_discovery_redis_instances_key(obj, service), &remaining, &redis_error)) {
+                    if (remaining == 0) {
+                        (void)kislayphp_discovery_redis_simple_write(obj, {"HDEL", kislayphp_discovery_redis_services_key(obj), service}, nullptr);
+                    } else {
+                        (void)kislayphp_discovery_redis_sync_service(obj, service, nullptr);
+                    }
+                }
+            }
+        } else {
+            if (!kislayphp_discovery_redis_simple_write(obj, {"DEL", kislayphp_discovery_redis_instances_key(obj, service)}, &redis_error)
+                || !kislayphp_discovery_redis_simple_write(obj, {"HDEL", kislayphp_discovery_redis_services_key(obj), service}, &redis_error)) {
+                kislayphp_discovery_warn_redis_fallback(redis_error);
+            }
+        }
+    }
+
+    pthread_rwlock_wrlock(&obj->lock);
     auto svc_it = obj->instances.find(service);
     if (svc_it != obj->instances.end()) {
         if (!instance_id.empty()) {
@@ -1005,7 +1200,7 @@ static bool kislayphp_discovery_deregister_local(
             obj->services.erase(it);
         }
     }
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
 
     if (removed_url != nullptr) {
         *removed_url = url;
@@ -1015,11 +1210,22 @@ static bool kislayphp_discovery_deregister_local(
 
 static void kislayphp_discovery_list_local(php_kislayphp_discovery_t *obj, zval *return_value) {
     array_init(return_value);
-    pthread_mutex_lock(&obj->lock);
+    if (obj->redis_enabled) {
+        std::string redis_error;
+        if (!kislayphp_discovery_redis_sync_all_services(obj, &redis_error)) {
+            kislayphp_discovery_warn_redis_fallback(redis_error);
+        }
+    }
+    std::vector<std::pair<std::string, std::string>> stale_instances;
+    pthread_rwlock_wrlock(&obj->lock);
+    kislayphp_discovery_prune_stale_locked(obj, nullptr, &stale_instances);
     for (const auto &entry : obj->services) {
         add_assoc_string(return_value, entry.first.c_str(), entry.second.c_str());
     }
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
+    for (const auto &stale : stale_instances) {
+        kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
+    }
 }
 
 static bool kislayphp_discovery_resolve_local(php_kislayphp_discovery_t *obj,
@@ -1030,17 +1236,18 @@ static bool kislayphp_discovery_resolve_local(php_kislayphp_discovery_t *obj,
     std::string value;
     std::vector<std::pair<std::string, std::string>> stale_instances;
 
-    pthread_mutex_lock(&obj->lock);
+    if (obj->redis_enabled) {
+        std::string redis_error;
+        if (!kislayphp_discovery_redis_sync_service(obj, service, &redis_error)) {
+            kislayphp_discovery_warn_redis_fallback(redis_error);
+        }
+    }
+
+    pthread_rwlock_wrlock(&obj->lock);
+    kislayphp_discovery_prune_stale_locked(obj, &service, &stale_instances);
     php_kislayphp_discovery_t::ServiceInstance selected;
     auto service_instances_it = obj->instances.find(service);
     if (service_instances_it != obj->instances.end() && !service_instances_it->second.empty()) {
-        const long long now_ms = kislayphp_now_ms();
-        for (const auto &inst_it : service_instances_it->second) {
-            const bool is_fresh = (now_ms - inst_it.second.last_heartbeat_ms) <= static_cast<long long>(obj->heartbeat_timeout_ms);
-            if (!is_fresh) {
-                stale_instances.push_back({service, inst_it.second.url});
-            }
-        }
         if (kislayphp_select_healthy_instance(obj, service, hash_key, &selected)) {
             value = selected.url;
             found = true;
@@ -1052,7 +1259,7 @@ static bool kislayphp_discovery_resolve_local(php_kislayphp_discovery_t *obj,
             found = true;
         }
     }
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
 
     for (const auto &stale : stale_instances) {
         kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
@@ -1068,14 +1275,25 @@ static void kislayphp_discovery_list_instances_local(php_kislayphp_discovery_t *
                                                      const std::string &service,
                                                      zval *return_value) {
     array_init(return_value);
-    pthread_mutex_lock(&obj->lock);
+    if (obj->redis_enabled) {
+        std::string redis_error;
+        if (!kislayphp_discovery_redis_sync_service(obj, service, &redis_error)) {
+            kislayphp_discovery_warn_redis_fallback(redis_error);
+        }
+    }
+    std::vector<std::pair<std::string, std::string>> stale_instances;
+    pthread_rwlock_wrlock(&obj->lock);
+    kislayphp_discovery_prune_stale_locked(obj, &service, &stale_instances);
     auto service_it = obj->instances.find(service);
     if (service_it != obj->instances.end()) {
         for (const auto &instance_it : service_it->second) {
             kislayphp_add_instance_array(return_value, instance_it.second);
         }
     }
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
+    for (const auto &stale : stale_instances) {
+        kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
+    }
 }
 
 static void kislayphp_discovery_resolve_all_local(php_kislayphp_discovery_t *obj,
@@ -1084,19 +1302,29 @@ static void kislayphp_discovery_resolve_all_local(php_kislayphp_discovery_t *obj
     array_init(return_value);
     std::vector<std::pair<int, std::string>> up_instances;
 
-    pthread_mutex_lock(&obj->lock);
-    const long long now_ms = kislayphp_now_ms();
+    if (obj->redis_enabled) {
+        std::string redis_error;
+        if (!kislayphp_discovery_redis_sync_service(obj, service, &redis_error)) {
+            kislayphp_discovery_warn_redis_fallback(redis_error);
+        }
+    }
+
+    std::vector<std::pair<std::string, std::string>> stale_instances;
+    pthread_rwlock_wrlock(&obj->lock);
+    kislayphp_discovery_prune_stale_locked(obj, &service, &stale_instances);
     auto service_it = obj->instances.find(service);
     if (service_it != obj->instances.end()) {
         for (const auto &inst_it : service_it->second) {
             const auto &inst = inst_it.second;
-            const bool is_fresh = (now_ms - inst.last_heartbeat_ms) <= static_cast<long long>(obj->heartbeat_timeout_ms);
-            if (inst.status == "UP" && is_fresh) {
+            if (inst.status == "UP") {
                 up_instances.push_back({inst.weight, inst.url});
             }
         }
     }
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
+    for (const auto &stale : stale_instances) {
+        kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
+    }
 
     std::sort(up_instances.begin(), up_instances.end(),
               [](const std::pair<int, std::string> &a, const std::pair<int, std::string> &b) {
@@ -1112,7 +1340,7 @@ static bool kislayphp_discovery_heartbeat_local(php_kislayphp_discovery_t *obj,
                                                 const std::string &service,
                                                 const std::string &instance_id) {
     bool updated = false;
-    pthread_mutex_lock(&obj->lock);
+    pthread_rwlock_wrlock(&obj->lock);
     auto service_it = obj->instances.find(service);
     if (service_it != obj->instances.end() && !service_it->second.empty()) {
         if (!instance_id.empty()) {
@@ -1130,7 +1358,29 @@ static bool kislayphp_discovery_heartbeat_local(php_kislayphp_discovery_t *obj,
             updated = true;
         }
     }
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
+
+    if (updated && obj->redis_enabled) {
+        std::string redis_error;
+        pthread_rwlock_wrlock(&obj->lock);
+        auto service_it = obj->instances.find(service);
+        if (service_it != obj->instances.end()) {
+            for (const auto &inst_it : service_it->second) {
+                if (!instance_id.empty() && inst_it.first != instance_id) {
+                    continue;
+                }
+                std::string payload_json;
+                if (kislayphp_discovery_instance_to_json(inst_it.second, &payload_json, &redis_error)
+                    && kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_instances_key(obj, service), inst_it.first, payload_json}, &redis_error)
+                    && kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_services_key(obj), service, inst_it.second.url}, &redis_error)) {
+                    continue;
+                }
+                kislayphp_discovery_warn_redis_fallback(redis_error);
+                break;
+            }
+        }
+        pthread_rwlock_unlock_wr(&obj->lock);
+    }
     return updated;
 }
 
@@ -1139,7 +1389,7 @@ static bool kislayphp_discovery_set_status_local(php_kislayphp_discovery_t *obj,
                                                  const std::string &normalized_status,
                                                  const std::string &instance_id) {
     bool updated = false;
-    pthread_mutex_lock(&obj->lock);
+    pthread_rwlock_wrlock(&obj->lock);
     auto service_it = obj->instances.find(service);
     if (service_it != obj->instances.end() && !service_it->second.empty()) {
         if (!instance_id.empty()) {
@@ -1155,8 +1405,29 @@ static bool kislayphp_discovery_set_status_local(php_kislayphp_discovery_t *obj,
             updated = true;
         }
     }
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
     if (updated) {
+        if (obj->redis_enabled) {
+            std::string redis_error;
+            pthread_rwlock_wrlock(&obj->lock);
+            auto service_it = obj->instances.find(service);
+            if (service_it != obj->instances.end()) {
+                for (const auto &inst_it : service_it->second) {
+                    if (!instance_id.empty() && inst_it.first != instance_id) {
+                        continue;
+                    }
+                    std::string payload_json;
+                    if (kislayphp_discovery_instance_to_json(inst_it.second, &payload_json, &redis_error)
+                        && kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_instances_key(obj, service), inst_it.first, payload_json}, &redis_error)
+                        && kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_services_key(obj), service, inst_it.second.url}, &redis_error)) {
+                        continue;
+                    }
+                    kislayphp_discovery_warn_redis_fallback(redis_error);
+                    break;
+                }
+            }
+            pthread_rwlock_unlock_wr(&obj->lock);
+        }
         kislayphp_discovery_emit(obj, "discovery.status.change", service, normalized_status);
     }
     return updated;
@@ -1239,6 +1510,476 @@ static bool kislayphp_socket_send_all(int fd, const std::string &payload, std::s
         sent += static_cast<size_t>(written);
     }
     return true;
+}
+
+struct kislayphp_redis_reply_t {
+    char type = 0;
+    std::string str;
+    long long integer = 0;
+    std::vector<kislayphp_redis_reply_t> elements;
+    bool is_nil = false;
+};
+
+static bool kislayphp_socket_set_timeout(int fd, zend_long timeout_ms) {
+    struct timeval tv;
+    tv.tv_sec = static_cast<int>(timeout_ms / 1000);
+    tv.tv_usec = static_cast<int>((timeout_ms % 1000) * 1000);
+    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0
+        && setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+}
+
+static bool kislayphp_redis_read_exact(int fd, size_t count, std::string *out, std::string *error_out = nullptr) {
+    out->clear();
+    out->reserve(count);
+    while (out->size() < count) {
+        char buffer[4096];
+        size_t remaining = count - out->size();
+        size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        ssize_t n = recv(fd, buffer, want, 0);
+        if (n <= 0) {
+            if (error_out != nullptr) {
+                *error_out = "Failed to read Redis payload";
+            }
+            return false;
+        }
+        out->append(buffer, static_cast<size_t>(n));
+    }
+    return true;
+}
+
+static bool kislayphp_redis_read_line(int fd, std::string *line_out, std::string *error_out = nullptr) {
+    line_out->clear();
+    char ch = '\0';
+    while (true) {
+        ssize_t n = recv(fd, &ch, 1, 0);
+        if (n <= 0) {
+            if (error_out != nullptr) {
+                *error_out = "Failed to read Redis response";
+            }
+            return false;
+        }
+        if (ch == '\r') {
+            ssize_t next = recv(fd, &ch, 1, 0);
+            if (next <= 0 || ch != '\n') {
+                if (error_out != nullptr) {
+                    *error_out = "Malformed Redis line ending";
+                }
+                return false;
+            }
+            return true;
+        }
+        line_out->push_back(ch);
+    }
+}
+
+static bool kislayphp_redis_read_reply(int fd, kislayphp_redis_reply_t *reply, std::string *error_out = nullptr) {
+    char prefix = '\0';
+    if (recv(fd, &prefix, 1, 0) <= 0) {
+        if (error_out != nullptr) {
+            *error_out = "Failed to read Redis reply prefix";
+        }
+        return false;
+    }
+
+    reply->type = prefix;
+    reply->str.clear();
+    reply->integer = 0;
+    reply->elements.clear();
+    reply->is_nil = false;
+
+    std::string line;
+    if (prefix == '+' || prefix == '-' || prefix == ':' || prefix == '$' || prefix == '*') {
+        if (!kislayphp_redis_read_line(fd, &line, error_out)) {
+            return false;
+        }
+    }
+
+    switch (prefix) {
+        case '+':
+            reply->str = line;
+            return true;
+        case '-':
+            reply->str = line;
+            if (error_out != nullptr) {
+                *error_out = line;
+            }
+            return false;
+        case ':':
+            reply->integer = std::strtoll(line.c_str(), nullptr, 10);
+            return true;
+        case '$': {
+            long long len = std::strtoll(line.c_str(), nullptr, 10);
+            if (len < 0) {
+                reply->is_nil = true;
+                return true;
+            }
+            if (!kislayphp_redis_read_exact(fd, static_cast<size_t>(len), &reply->str, error_out)) {
+                return false;
+            }
+            std::string crlf;
+            return kislayphp_redis_read_exact(fd, 2, &crlf, error_out) && crlf == "\r\n";
+        }
+        case '*': {
+            long long count = std::strtoll(line.c_str(), nullptr, 10);
+            if (count < 0) {
+                reply->is_nil = true;
+                return true;
+            }
+            reply->elements.reserve(static_cast<size_t>(count));
+            for (long long i = 0; i < count; ++i) {
+                kislayphp_redis_reply_t item;
+                if (!kislayphp_redis_read_reply(fd, &item, error_out)) {
+                    return false;
+                }
+                reply->elements.push_back(std::move(item));
+            }
+            return true;
+        }
+        default:
+            if (error_out != nullptr) {
+                *error_out = "Unsupported Redis reply type";
+            }
+            return false;
+    }
+}
+
+static std::string kislayphp_redis_encode_command(const std::vector<std::string> &parts) {
+    std::ostringstream out;
+    out << "*" << parts.size() << "\r\n";
+    for (const auto &part : parts) {
+        out << "$" << part.size() << "\r\n" << part << "\r\n";
+    }
+    return out.str();
+}
+
+static bool kislayphp_discovery_redis_connect(php_kislayphp_discovery_t *obj, int *fd_out, std::string *error_out = nullptr) {
+    if (!obj->redis_enabled) {
+        return false;
+    }
+
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *result = nullptr;
+    std::string port = std::to_string(obj->redis_port);
+    if (getaddrinfo(obj->redis_host.c_str(), port.c_str(), &hints, &result) != 0) {
+        if (error_out != nullptr) {
+            *error_out = "Failed to resolve Redis host";
+        }
+        return false;
+    }
+
+    int fd = -1;
+    for (struct addrinfo *rp = result; rp != nullptr; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        kislayphp_socket_set_timeout(fd, obj->redis_timeout_ms);
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;
+        }
+        kislayphp_socket_close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(result);
+
+    if (fd < 0) {
+        if (error_out != nullptr) {
+            *error_out = "Failed to connect to Redis";
+        }
+        return false;
+    }
+
+    auto run_simple = [&](const std::vector<std::string> &parts) -> bool {
+        kislayphp_redis_reply_t reply;
+        std::string command = kislayphp_redis_encode_command(parts);
+        if (!kislayphp_socket_send_all(fd, command, error_out)) {
+            return false;
+        }
+        if (!kislayphp_redis_read_reply(fd, &reply, error_out)) {
+            return false;
+        }
+        return reply.type == '+' || reply.type == ':' || reply.type == '$';
+    };
+
+    if (!obj->redis_password.empty()) {
+        if (!run_simple({"AUTH", obj->redis_password})) {
+            kislayphp_socket_close(fd);
+            return false;
+        }
+    }
+    if (obj->redis_db > 0) {
+        if (!run_simple({"SELECT", std::to_string(obj->redis_db)})) {
+            kislayphp_socket_close(fd);
+            return false;
+        }
+    }
+
+    *fd_out = fd;
+    return true;
+}
+
+static bool kislayphp_discovery_redis_command(php_kislayphp_discovery_t *obj,
+                                              const std::vector<std::string> &parts,
+                                              kislayphp_redis_reply_t *reply,
+                                              std::string *error_out = nullptr) {
+    int fd = -1;
+    if (!kislayphp_discovery_redis_connect(obj, &fd, error_out)) {
+        return false;
+    }
+    std::string command = kislayphp_redis_encode_command(parts);
+    bool ok = kislayphp_socket_send_all(fd, command, error_out)
+        && kislayphp_redis_read_reply(fd, reply, error_out);
+    kislayphp_socket_close(fd);
+    return ok;
+}
+
+static std::string kislayphp_discovery_redis_services_key(php_kislayphp_discovery_t *obj) {
+    return obj->redis_prefix + ":services";
+}
+
+static std::string kislayphp_discovery_redis_instances_key(php_kislayphp_discovery_t *obj, const std::string &service) {
+    return obj->redis_prefix + ":instances:" + service;
+}
+
+static bool kislayphp_discovery_instance_to_json(const php_kislayphp_discovery_t::ServiceInstance &instance,
+                                                 std::string *json_out,
+                                                 std::string *error_out = nullptr) {
+    zval payload;
+    array_init(&payload);
+    add_assoc_string(&payload, "service", instance.service_name.c_str());
+    add_assoc_string(&payload, "instanceId", instance.instance_id.c_str());
+    add_assoc_string(&payload, "url", instance.url.c_str());
+    add_assoc_string(&payload, "status", instance.status.c_str());
+    add_assoc_long(&payload, "lastHeartbeat", static_cast<zend_long>(instance.last_heartbeat_ms));
+    add_assoc_long(&payload, "weight", instance.weight);
+
+    zval metadata;
+    array_init(&metadata);
+    for (const auto &entry : instance.metadata) {
+        add_assoc_string(&metadata, entry.first.c_str(), entry.second.c_str());
+    }
+    add_assoc_zval(&payload, "metadata", &metadata);
+
+    bool ok = kislayphp_json_encode_zval(&payload, json_out, error_out);
+    zval_ptr_dtor(&payload);
+    return ok;
+}
+
+static bool kislayphp_discovery_instance_from_json(const std::string &json,
+                                                   php_kislayphp_discovery_t::ServiceInstance *instance,
+                                                   std::string *error_out = nullptr) {
+    zval decoded;
+    ZVAL_UNDEF(&decoded);
+    if (!kislayphp_json_decode_assoc(json, &decoded, error_out)) {
+        return false;
+    }
+    if (Z_TYPE(decoded) != IS_ARRAY) {
+        zval_ptr_dtor(&decoded);
+        if (error_out != nullptr) {
+            *error_out = "Redis instance payload must decode to an array";
+        }
+        return false;
+    }
+
+    auto get_string = [&](const char *key) -> std::string {
+        zval *value = zend_hash_str_find(Z_ARRVAL(decoded), key, std::strlen(key));
+        if (value == nullptr) {
+            return "";
+        }
+        zend_string *str = zval_get_string(value);
+        std::string out(ZSTR_VAL(str), ZSTR_LEN(str));
+        zend_string_release(str);
+        return out;
+    };
+
+    instance->service_name = get_string("service");
+    instance->instance_id = get_string("instanceId");
+    instance->url = get_string("url");
+    instance->status = get_string("status");
+
+    zval *heartbeat = zend_hash_str_find(Z_ARRVAL(decoded), "lastHeartbeat", sizeof("lastHeartbeat") - 1);
+    instance->last_heartbeat_ms = heartbeat ? zval_get_long(heartbeat) : 0;
+    zval *weight = zend_hash_str_find(Z_ARRVAL(decoded), "weight", sizeof("weight") - 1);
+    instance->weight = weight ? std::max(1, static_cast<int>(zval_get_long(weight))) : 1;
+
+    instance->metadata.clear();
+    zval *metadata = zend_hash_str_find(Z_ARRVAL(decoded), "metadata", sizeof("metadata") - 1);
+    if (metadata != nullptr && Z_TYPE_P(metadata) == IS_ARRAY) {
+        zval *entry = nullptr;
+        zend_string *key = nullptr;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(metadata), key, entry) {
+            if (key == nullptr || entry == nullptr) {
+                continue;
+            }
+            zend_string *val = zval_get_string(entry);
+            instance->metadata[std::string(ZSTR_VAL(key), ZSTR_LEN(key))] = std::string(ZSTR_VAL(val), ZSTR_LEN(val));
+            zend_string_release(val);
+        } ZEND_HASH_FOREACH_END();
+    }
+
+    zval_ptr_dtor(&decoded);
+    return !instance->service_name.empty() && !instance->instance_id.empty() && !instance->url.empty();
+}
+
+static bool kislayphp_discovery_redis_hgetall(php_kislayphp_discovery_t *obj,
+                                              const std::string &key,
+                                              std::unordered_map<std::string, std::string> *pairs,
+                                              std::string *error_out = nullptr) {
+    kislayphp_redis_reply_t reply;
+    if (!kislayphp_discovery_redis_command(obj, {"HGETALL", key}, &reply, error_out)) {
+        return false;
+    }
+    if (reply.type != '*' || (reply.elements.size() % 2) != 0) {
+        if (error_out != nullptr) {
+            *error_out = "Unexpected Redis HGETALL reply";
+        }
+        return false;
+    }
+    pairs->clear();
+    for (size_t i = 0; i < reply.elements.size(); i += 2) {
+        (*pairs)[reply.elements[i].str] = reply.elements[i + 1].str;
+    }
+    return true;
+}
+
+static bool kislayphp_discovery_redis_hget(php_kislayphp_discovery_t *obj,
+                                           const std::string &key,
+                                           const std::string &field,
+                                           std::string *value_out,
+                                           bool *exists_out,
+                                           std::string *error_out = nullptr) {
+    kislayphp_redis_reply_t reply;
+    if (!kislayphp_discovery_redis_command(obj, {"HGET", key, field}, &reply, error_out)) {
+        return false;
+    }
+    if (reply.type != '$') {
+        if (error_out != nullptr) {
+            *error_out = "Unexpected Redis HGET reply";
+        }
+        return false;
+    }
+    *exists_out = !reply.is_nil;
+    value_out->assign(reply.str);
+    return true;
+}
+
+static bool kislayphp_discovery_redis_hlen(php_kislayphp_discovery_t *obj,
+                                           const std::string &key,
+                                           long long *count_out,
+                                           std::string *error_out = nullptr) {
+    kislayphp_redis_reply_t reply;
+    if (!kislayphp_discovery_redis_command(obj, {"HLEN", key}, &reply, error_out)) {
+        return false;
+    }
+    if (reply.type != ':') {
+        if (error_out != nullptr) {
+            *error_out = "Unexpected Redis HLEN reply";
+        }
+        return false;
+    }
+    *count_out = reply.integer;
+    return true;
+}
+
+static bool kislayphp_discovery_redis_simple_write(php_kislayphp_discovery_t *obj,
+                                                   const std::vector<std::string> &parts,
+                                                   std::string *error_out = nullptr) {
+    kislayphp_redis_reply_t reply;
+    if (!kislayphp_discovery_redis_command(obj, parts, &reply, error_out)) {
+        return false;
+    }
+    return reply.type == '+' || reply.type == ':' || reply.type == '$';
+}
+
+static bool kislayphp_discovery_redis_sync_service(php_kislayphp_discovery_t *obj,
+                                                   const std::string &service,
+                                                   std::string *error_out = nullptr) {
+    if (!obj->redis_enabled) {
+        return false;
+    }
+
+    std::unordered_map<std::string, std::string> raw_instances;
+    if (!kislayphp_discovery_redis_hgetall(obj,
+                                           kislayphp_discovery_redis_instances_key(obj, service),
+                                           &raw_instances,
+                                           error_out)) {
+        return false;
+    }
+
+    std::unordered_map<std::string, php_kislayphp_discovery_t::ServiceInstance> fresh_instances;
+    std::vector<std::pair<std::string, std::string>> stale_instances;
+    const long long now_ms = kislayphp_now_ms();
+    for (const auto &entry : raw_instances) {
+        php_kislayphp_discovery_t::ServiceInstance instance;
+        if (!kislayphp_discovery_instance_from_json(entry.second, &instance, error_out)) {
+            continue;
+        }
+        const bool is_fresh = (now_ms - instance.last_heartbeat_ms) <= static_cast<long long>(obj->heartbeat_timeout_ms);
+        if (!is_fresh) {
+            stale_instances.push_back({service, instance.url});
+            (void)kislayphp_discovery_redis_simple_write(obj,
+                                                         {"HDEL", kislayphp_discovery_redis_instances_key(obj, service), entry.first},
+                                                         nullptr);
+            continue;
+        }
+        fresh_instances[entry.first] = instance;
+    }
+
+    if (fresh_instances.empty()) {
+        (void)kislayphp_discovery_redis_simple_write(obj, {"HDEL", kislayphp_discovery_redis_services_key(obj), service}, nullptr);
+        (void)kislayphp_discovery_redis_simple_write(obj, {"DEL", kislayphp_discovery_redis_instances_key(obj, service)}, nullptr);
+        pthread_rwlock_wrlock(&obj->lock);
+        obj->instances.erase(service);
+        obj->services.erase(service);
+        obj->rr_index.erase(service);
+        pthread_rwlock_unlock_wr(&obj->lock);
+    } else {
+        std::string primary_url = fresh_instances.begin()->second.url;
+        (void)kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_services_key(obj), service, primary_url}, nullptr);
+        pthread_rwlock_wrlock(&obj->lock);
+        obj->instances[service] = fresh_instances;
+        obj->services[service] = primary_url;
+        pthread_rwlock_unlock_wr(&obj->lock);
+    }
+
+    for (const auto &stale : stale_instances) {
+        kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
+    }
+    return true;
+}
+
+static bool kislayphp_discovery_redis_sync_all_services(php_kislayphp_discovery_t *obj,
+                                                        std::string *error_out = nullptr) {
+    if (!obj->redis_enabled) {
+        return false;
+    }
+
+    std::unordered_map<std::string, std::string> services;
+    if (!kislayphp_discovery_redis_hgetall(obj, kislayphp_discovery_redis_services_key(obj), &services, error_out)) {
+        return false;
+    }
+
+    pthread_rwlock_wrlock(&obj->lock);
+    obj->services.clear();
+    obj->instances.clear();
+    obj->rr_index.clear();
+    pthread_rwlock_unlock_wr(&obj->lock);
+
+    for (const auto &entry : services) {
+        std::string ignored_error;
+        if (!kislayphp_discovery_redis_sync_service(obj, entry.first, &ignored_error) && error_out != nullptr && error_out->empty()) {
+            *error_out = ignored_error;
+        }
+    }
+    return true;
+}
+
+static void kislayphp_discovery_warn_redis_fallback(const std::string &error) {
+    php_error_docref(nullptr, E_WARNING, "Redis discovery backend failed (%s); using in-memory registry state", error.c_str());
 }
 
 static bool kislayphp_http_parse_response(const std::string &raw,
@@ -1643,7 +2384,11 @@ static bool kislayphp_discovery_server_handle_request(php_kislayphp_discovery_t 
 
         std::unordered_map<std::string, std::string> metadata;
         kislayphp_discovery_metadata_from_params(request.params, metadata);
-        kislayphp_discovery_register_local(obj, name_it->second, url_it->second, metadata, instance_id);
+        if (!kislayphp_discovery_register_local(obj, name_it->second, url_it->second, metadata, instance_id)) {
+            response->status = 409;
+            response->body = "{\"error\":\"maximum instances per service exceeded\"}";
+            return true;
+        }
         kislayphp_discovery_emit(obj, "discovery.register", name_it->second, url_it->second);
         response->body = "{\"ok\":true}";
         return true;
@@ -2038,18 +2783,10 @@ PHP_METHOD(KislayPHPDiscovery, register) {
         RETURN_TRUE;
     }
 
-    pthread_mutex_lock(&obj->lock);
-    php_kislayphp_discovery_t::ServiceInstance record;
-    record.service_name = service;
-    record.instance_id = instance;
-    record.url = service_url;
-    record.status = "UP";
-    record.metadata = metadata;
-    record.weight = inst_weight;
-    record.last_heartbeat_ms = kislayphp_now_ms();
-    obj->instances[service][instance] = record;
-    obj->services[service] = service_url;
-    pthread_mutex_unlock(&obj->lock);
+    if (!kislayphp_discovery_register_local(obj, service, service_url, metadata, instance)) {
+        zend_throw_exception(zend_ce_exception, "Maximum instances per service exceeded", 0);
+        RETURN_FALSE;
+    }
 
 #ifdef KISLAYPHP_RPC
     if (!obj->has_client && kislayphp_rpc_enabled()) {
@@ -2232,7 +2969,7 @@ PHP_METHOD(KislayPHPDiscovery, deregister) {
     }
 #endif
 
-    pthread_mutex_lock(&obj->lock);
+    pthread_rwlock_wrlock(&obj->lock);
     auto svc_it = obj->instances.find(key);
     if (svc_it != obj->instances.end()) {
         if (instance_id != nullptr && instance_id_len > 0) {
@@ -2263,7 +3000,7 @@ PHP_METHOD(KislayPHPDiscovery, deregister) {
             obj->services.erase(it);
         }
     }
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
     if (!url.empty()) {
         kislayphp_discovery_emit(obj, "discovery.deregister", key, url);
     }
@@ -2316,12 +3053,7 @@ PHP_METHOD(KislayPHPDiscovery, list) {
     }
 #endif
 
-    array_init(return_value);
-    pthread_mutex_lock(&obj->lock);
-    for (const auto &entry : obj->services) {
-        add_assoc_string(return_value, entry.first.c_str(), entry.second.c_str());
-    }
-    pthread_mutex_unlock(&obj->lock);
+    kislayphp_discovery_list_local(obj, return_value);
 }
 
 PHP_METHOD(KislayPHPDiscovery, resolve) {
@@ -2391,43 +3123,14 @@ PHP_METHOD(KislayPHPDiscovery, resolve) {
     }
 #endif
 
-    std::string value;
-    bool found = false;
-    std::vector<std::pair<std::string, std::string>> stale_instances;
-    pthread_mutex_lock(&obj->lock);
-    std::string key(name, name_len);
-    php_kislayphp_discovery_t::ServiceInstance selected;
-    auto service_instances_it = obj->instances.find(key);
-    if (service_instances_it != obj->instances.end() && !service_instances_it->second.empty()) {
-        const long long now_ms = kislayphp_now_ms();
-        for (const auto &inst_it : service_instances_it->second) {
-            const bool is_fresh = (now_ms - inst_it.second.last_heartbeat_ms) <= static_cast<long long>(obj->heartbeat_timeout_ms);
-            if (!is_fresh) {
-                stale_instances.push_back({key, inst_it.second.url});
-            }
-        }
-        std::string routing_key = (hash_key != nullptr && hash_key_len > 0)
-            ? std::string(hash_key, hash_key_len)
-            : std::string();
-        if (kislayphp_select_healthy_instance(obj, key, routing_key, &selected)) {
-            value = selected.url;
-            found = true;
-        }
-    } else {
-        auto it = obj->services.find(key);
-        if (it != obj->services.end()) {
-            value = it->second;
-            found = true;
-        }
-    }
-    pthread_mutex_unlock(&obj->lock);
-    for (const auto &stale : stale_instances) {
-        kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
-    }
-    if (!found) {
+    std::string resolved_url;
+    std::string routing_key = (hash_key != nullptr && hash_key_len > 0)
+        ? std::string(hash_key, hash_key_len)
+        : std::string();
+    if (!kislayphp_discovery_resolve_local(obj, std::string(name, name_len), routing_key, &resolved_url)) {
         RETURN_NULL();
     }
-    RETURN_STRING(value.c_str());
+    RETURN_STRING(resolved_url.c_str());
 }
 
 PHP_METHOD(KislayPHPDiscovery, listInstances) {
@@ -2489,14 +3192,7 @@ PHP_METHOD(KislayPHPDiscovery, listInstances) {
     }
 #endif
 
-    pthread_mutex_lock(&obj->lock);
-    auto service_it = obj->instances.find(std::string(name, name_len));
-    if (service_it != obj->instances.end()) {
-        for (const auto &instance_it : service_it->second) {
-            kislayphp_add_instance_array(return_value, instance_it.second);
-        }
-    }
-    pthread_mutex_unlock(&obj->lock);
+    kislayphp_discovery_list_instances_local(obj, std::string(name, name_len), return_value);
 }
 
 PHP_METHOD(KislayPHPDiscovery, heartbeat) {
@@ -2589,25 +3285,11 @@ PHP_METHOD(KislayPHPDiscovery, heartbeat) {
     }
 #endif
 
-    pthread_mutex_lock(&obj->lock);
-    auto service_it = obj->instances.find(key);
-    if (service_it != obj->instances.end() && !service_it->second.empty()) {
-        if (instance_id != nullptr && instance_id_len > 0) {
-            auto inst_it = service_it->second.find(std::string(instance_id, instance_id_len));
-            if (inst_it != service_it->second.end()) {
-                inst_it->second.last_heartbeat_ms = kislayphp_now_ms();
-                inst_it->second.status = "UP";
-                updated = true;
-            }
-        } else {
-            for (auto &inst_it : service_it->second) {
-                inst_it.second.last_heartbeat_ms = kislayphp_now_ms();
-                inst_it.second.status = "UP";
-            }
-            updated = true;
-        }
-    }
-    pthread_mutex_unlock(&obj->lock);
+    updated = kislayphp_discovery_heartbeat_local(obj,
+                                                  key,
+                                                  (instance_id != nullptr && instance_id_len > 0)
+                                                      ? std::string(instance_id, instance_id_len)
+                                                      : std::string());
 
     RETURN_BOOL(updated);
 }
@@ -2717,26 +3399,12 @@ PHP_METHOD(KislayPHPDiscovery, setStatus) {
     }
 #endif
 
-    pthread_mutex_lock(&obj->lock);
-    auto service_it = obj->instances.find(key);
-    if (service_it != obj->instances.end() && !service_it->second.empty()) {
-        if (instance_id != nullptr && instance_id_len > 0) {
-            auto inst_it = service_it->second.find(std::string(instance_id, instance_id_len));
-            if (inst_it != service_it->second.end()) {
-                inst_it->second.status = normalized;
-                updated = true;
-            }
-        } else {
-            for (auto &inst_it : service_it->second) {
-                inst_it.second.status = normalized;
-            }
-            updated = true;
-        }
-    }
-    pthread_mutex_unlock(&obj->lock);
-    if (updated) {
-        kislayphp_discovery_emit(obj, "discovery.status.change", key, normalized);
-    }
+    updated = kislayphp_discovery_set_status_local(obj,
+                                                   key,
+                                                   normalized,
+                                                   (instance_id != nullptr && instance_id_len > 0)
+                                                       ? std::string(instance_id, instance_id_len)
+                                                       : std::string());
     RETURN_BOOL(updated);
 }
 
@@ -2747,9 +3415,11 @@ PHP_METHOD(KislayPHPDiscovery, setHeartbeatTimeout) {
     ZEND_PARSE_PARAMETERS_END();
 
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    pthread_rwlock_wrlock(&obj->lock);
     obj->heartbeat_timeout_ms = kislayphp_sanitize_heartbeat_timeout_ms(
         milliseconds,
         "Kislay\\Discovery\\ServiceRegistry::setHeartbeatTimeout");
+    pthread_rwlock_unlock_wr(&obj->lock);
     RETURN_TRUE;
 }
 
@@ -2810,19 +3480,22 @@ PHP_METHOD(KislayPHPDiscovery, resolveAll) {
     std::string key(name, name_len);
     std::vector<std::pair<int, std::string>> up_instances;
 
-    pthread_mutex_lock(&obj->lock);
-    const long long now_ms = kislayphp_now_ms();
+    std::vector<std::pair<std::string, std::string>> stale_instances;
+    pthread_rwlock_wrlock(&obj->lock);
+    kislayphp_discovery_prune_stale_locked(obj, &key, &stale_instances);
     auto service_it = obj->instances.find(key);
     if (service_it != obj->instances.end()) {
         for (const auto &inst_it : service_it->second) {
             const auto &inst = inst_it.second;
-            const bool is_fresh = (now_ms - inst.last_heartbeat_ms) <= static_cast<long long>(obj->heartbeat_timeout_ms);
-            if (inst.status == "UP" && is_fresh) {
+            if (inst.status == "UP") {
                 up_instances.push_back({inst.weight, inst.url});
             }
         }
     }
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
+    for (const auto &stale : stale_instances) {
+        kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
+    }
 
     std::sort(up_instances.begin(), up_instances.end(),
               [](const std::pair<int,std::string> &a, const std::pair<int,std::string> &b) {
@@ -2849,13 +3522,17 @@ PHP_METHOD(KislayPHPDiscovery, setBalancer) {
         return;
     }
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    pthread_rwlock_wrlock(&obj->lock);
     obj->balancer_type = balancer;
+    pthread_rwlock_unlock_wr(&obj->lock);
 }
 
 PHP_METHOD(KislayPHPDiscovery, resetBalancer) {
     ZEND_PARSE_PARAMETERS_NONE();
     php_kislayphp_discovery_t *obj = php_kislayphp_discovery_from_obj(Z_OBJ_P(getThis()));
+    pthread_rwlock_wrlock(&obj->lock);
     obj->balancer_type = "weighted_random";
+    pthread_rwlock_unlock_wr(&obj->lock);
 }
 
 PHP_METHOD(KislayPHPDiscovery, getWeight) {
@@ -2873,7 +3550,16 @@ PHP_METHOD(KislayPHPDiscovery, getWeight) {
     std::string service_url(url, url_len);
     int weight = 1;
 
-    pthread_mutex_lock(&obj->lock);
+    if (obj->redis_enabled) {
+        std::string redis_error;
+        if (!kislayphp_discovery_redis_sync_service(obj, service, &redis_error)) {
+            kislayphp_discovery_warn_redis_fallback(redis_error);
+        }
+    }
+
+    std::vector<std::pair<std::string, std::string>> stale_instances;
+    pthread_rwlock_wrlock(&obj->lock);
+    kislayphp_discovery_prune_stale_locked(obj, &service, &stale_instances);
     auto service_it = obj->instances.find(service);
     if (service_it != obj->instances.end()) {
         for (const auto &inst_it : service_it->second) {
@@ -2883,7 +3569,10 @@ PHP_METHOD(KislayPHPDiscovery, getWeight) {
             }
         }
     }
-    pthread_mutex_unlock(&obj->lock);
+    pthread_rwlock_unlock_wr(&obj->lock);
+    for (const auto &stale : stale_instances) {
+        kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
+    }
     RETURN_LONG(weight);
 }
 
@@ -2917,7 +3606,6 @@ static const zend_function_entry kislayphp_discovery_client_methods[] = {
 };
 
 PHP_MINIT_FUNCTION(kislayphp_discovery) {
-    srand(static_cast<unsigned>(time(nullptr)));
     zend_class_entry ce;
     INIT_NS_CLASS_ENTRY(ce, "Kislay\\Discovery", "ClientInterface", kislayphp_discovery_client_methods);
     kislayphp_discovery_client_ce = zend_register_internal_interface(&ce);
