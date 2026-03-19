@@ -9,7 +9,7 @@
 
 **Via PIE (recommended):**
 ```bash
-pie install kislayphp/discovery:0.0.6
+pie install kislayphp/discovery:0.0.7
 ```
 
 Add to `php.ini`:
