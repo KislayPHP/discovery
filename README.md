@@ -80,6 +80,7 @@ When Redis is configured:
 - writes are mirrored locally and sent to Redis
 - reads attempt Redis first
 - on Redis failure, Discovery falls back to in-memory state with a warning
+- fallback preserves node-local safety, not cluster-wide strong consistency
 
 ## Environment Variables
 

@@ -102,6 +102,7 @@ Behavior:
 - registry writes are pushed to Redis
 - registry reads synchronize from Redis when available
 - Redis failure falls back to in-memory state with warning
+- fallback keeps the current node operational, but it does not provide cross-node consistency while Redis is down
 
 This keeps dependencies light while still allowing shared registry state.
 
