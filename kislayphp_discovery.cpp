@@ -2523,26 +2523,32 @@ static bool kislayphp_discovery_server_run(php_kislayphp_discovery_t *obj,
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
         if (client_fd < 0) {
-            continue;
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
         }
 
         kislayphp_http_request_t request;
         kislayphp_http_response_t response;
         std::string request_error;
         if (!kislayphp_http_read_request(client_fd, &request, &request_error)) {
-            kislayphp_http_send_response(client_fd, 400, "application/json", "{\"error\":\"bad request\"}", nullptr);
+            kislayphp_http_send_response(client_fd, 400, "application/json",
+                "{\"error\":\"bad request\"}", nullptr);
             kislayphp_socket_close(client_fd);
             continue;
         }
 
         std::string handler_error;
         if (!kislayphp_discovery_server_handle_request(obj, request, &response, &handler_error)) {
-            kislayphp_http_send_response(client_fd, 500, "application/json", "{\"error\":\"internal error\"}", nullptr);
+            kislayphp_http_send_response(client_fd, 500, "application/json",
+                "{\"error\":\"internal error\"}", nullptr);
             kislayphp_socket_close(client_fd);
             continue;
         }
 
-        kislayphp_http_send_response(client_fd, response.status, response.content_type, response.body, nullptr);
+        kislayphp_http_send_response(client_fd, response.status,
+            response.content_type, response.body, nullptr);
         kislayphp_socket_close(client_fd);
     }
 
