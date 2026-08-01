@@ -146,31 +146,6 @@ static bool kislayphp_call_php_function(const char *function_name,
     return result == SUCCESS && EG(exception) == nullptr;
 }
 
-static std::string kislayphp_json_escape(const std::string &value) {
-    std::string escaped;
-    escaped.reserve(value.size() + 8);
-    for (unsigned char ch : value) {
-        switch (ch) {
-            case '\\': escaped += "\\\\"; break;
-            case '"': escaped += "\\\""; break;
-            case '\b': escaped += "\\b"; break;
-            case '\f': escaped += "\\f"; break;
-            case '\n': escaped += "\\n"; break;
-            case '\r': escaped += "\\r"; break;
-            case '\t': escaped += "\\t"; break;
-            default:
-                if (ch < 0x20) {
-                    char buffer[7];
-                    std::snprintf(buffer, sizeof(buffer), "\\u%04x", ch);
-                    escaped += buffer;
-                } else {
-                    escaped.push_back(static_cast<char>(ch));
-                }
-        }
-    }
-    return escaped;
-}
-
 static std::string kislayphp_url_encode(const std::string &value) {
     static const char hex[] = "0123456789ABCDEF";
     std::string encoded;
