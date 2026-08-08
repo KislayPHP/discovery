@@ -850,8 +850,24 @@ static bool kislayphp_discovery_prune_stale_locked(
         auto &service_instances = service_it->second;
         for (auto inst_it = service_instances.begin(); inst_it != service_instances.end();) {
             const auto &instance = inst_it->second;
-            const bool is_fresh = (now_ms - instance.last_heartbeat_ms) <= static_cast<long long>(obj->heartbeat_timeout_ms);
-            if (is_fresh) {
+            // Deliberately a longer grace period than the plain heartbeat_timeout_ms
+            // used by kislayphp_select_healthy_instance()'s own is_fresh check for
+            // resolve()/resolveAll() selection - that check already correctly
+            // excludes a stale-but-not-yet-pruned instance from being resolved.
+            // This function actually ERASES the instance record, called as a side
+            // effect of every resolve()/listInstances() call (there is no separate
+            // background GC thread) - erasing on the exact same threshold used for
+            // selection meant heartbeat() could never revive an instance that had
+            // gone stale by even a few milliseconds before the next resolve() call
+            // pruned it out from under a service that was actively trying to
+            // recover (confirmed via tests/heartbeat_timeout_and_status_test.phpt -
+            // register, sleep past timeout, resolve()==NULL as expected, but
+            // heartbeat() then failed because the record was already gone).
+            static constexpr long long kPruneGraceMultiplier = 3;
+            const bool eligible_for_prune =
+                (now_ms - instance.last_heartbeat_ms) >
+                static_cast<long long>(obj->heartbeat_timeout_ms) * kPruneGraceMultiplier;
+            if (!eligible_for_prune) {
                 ++inst_it;
                 continue;
             }

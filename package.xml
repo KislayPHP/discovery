@@ -16,15 +16,15 @@
   </lead>
   <date>2026-08-08</date>
   <version>
-    <release>1.0.0</release>
-    <api>1.0.0</api>
+    <release>1.0.1</release>
+    <api>1.0.1</api>
   </version>
   <stability>
     <release>beta</release>
     <api>beta</api>
   </stability>
   <license>Apache-2.0</license>
-  <notes>Release 1.0.0 (first stable-milestone tag): fixed a resolve() locking bug, dead code cleanup.</notes>
+  <notes>Release 1.0.1: fixed heartbeat() being unable to revive an instance that had already been pruned by a resolve() call at the exact same staleness threshold used for selection - pruning now uses a longer grace window (3x heartbeat_timeout_ms) than resolve()'s own freshness check, so a briefly-stale instance stays revivable via heartbeat() instead of requiring full re-registration. Caught by tests/heartbeat_timeout_and_status_test.phpt.</notes>
   <contents>
     <dir name="/">
       <file name="config.m4" role="src" />
