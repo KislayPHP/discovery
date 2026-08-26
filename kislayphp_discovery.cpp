@@ -20,6 +20,7 @@ extern "C" {
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #ifdef _WIN32
@@ -834,6 +835,23 @@ static size_t kislayphp_random_index(size_t size) {
     return dist(rng);
 }
 
+// Deliberately a longer grace period than the plain heartbeat_timeout_ms used
+// by kislayphp_select_healthy_instance()'s own is_fresh check for
+// resolve()/resolveAll() selection - that check already correctly excludes a
+// stale-but-not-yet-pruned instance from being resolved. kislayphp_discovery_
+// prune_stale_locked() actually ERASES the instance record, called as a side
+// effect of every resolve()/listInstances() call (there is no separate
+// background GC thread) - erasing on the exact same threshold used for
+// selection meant heartbeat() could never revive an instance that had gone
+// stale by even a few milliseconds before the next resolve() call pruned it
+// out from under a service that was actively trying to recover (confirmed
+// via tests/heartbeat_timeout_and_status_test.phpt - register, sleep past
+// timeout, resolve()==NULL as expected, but heartbeat() then failed because
+// the record was already gone). Shared with kislayphp_discovery_has_stale_
+// locked() below so the read-only "is a prune even needed" check can never
+// drift out of sync with what prune_stale_locked() actually erases.
+static constexpr long long kKislayDiscoveryPruneGraceMultiplier = 3;
+
 static bool kislayphp_discovery_prune_stale_locked(
     php_kislayphp_discovery_t *obj,
     const std::string *only_service,
@@ -850,23 +868,9 @@ static bool kislayphp_discovery_prune_stale_locked(
         auto &service_instances = service_it->second;
         for (auto inst_it = service_instances.begin(); inst_it != service_instances.end();) {
             const auto &instance = inst_it->second;
-            // Deliberately a longer grace period than the plain heartbeat_timeout_ms
-            // used by kislayphp_select_healthy_instance()'s own is_fresh check for
-            // resolve()/resolveAll() selection - that check already correctly
-            // excludes a stale-but-not-yet-pruned instance from being resolved.
-            // This function actually ERASES the instance record, called as a side
-            // effect of every resolve()/listInstances() call (there is no separate
-            // background GC thread) - erasing on the exact same threshold used for
-            // selection meant heartbeat() could never revive an instance that had
-            // gone stale by even a few milliseconds before the next resolve() call
-            // pruned it out from under a service that was actively trying to
-            // recover (confirmed via tests/heartbeat_timeout_and_status_test.phpt -
-            // register, sleep past timeout, resolve()==NULL as expected, but
-            // heartbeat() then failed because the record was already gone).
-            static constexpr long long kPruneGraceMultiplier = 3;
             const bool eligible_for_prune =
                 (now_ms - instance.last_heartbeat_ms) >
-                static_cast<long long>(obj->heartbeat_timeout_ms) * kPruneGraceMultiplier;
+                static_cast<long long>(obj->heartbeat_timeout_ms) * kKislayDiscoveryPruneGraceMultiplier;
             if (!eligible_for_prune) {
                 ++inst_it;
                 continue;
@@ -891,6 +895,32 @@ static bool kislayphp_discovery_prune_stale_locked(
     }
 
     return removed_any;
+}
+
+// Read-only companion to kislayphp_discovery_prune_stale_locked(): reports
+// whether any instance in `only_service` (or, if null, any service) has
+// crossed the same prune threshold, without mutating anything. Used to keep
+// the common resolve() path on a read lock (see kislayphp_discovery_resolve_
+// local()) and only escalate to the write lock actually needed for pruning.
+// Callable under either a read or a write lock.
+static bool kislayphp_discovery_has_stale_locked(
+    php_kislayphp_discovery_t *obj,
+    const std::string *only_service) {
+    const long long now_ms = kislayphp_now_ms();
+    for (const auto &service_it : obj->instances) {
+        if (only_service != nullptr && service_it.first != *only_service) {
+            continue;
+        }
+        for (const auto &inst_it : service_it.second) {
+            const bool eligible_for_prune =
+                (now_ms - inst_it.second.last_heartbeat_ms) >
+                static_cast<long long>(obj->heartbeat_timeout_ms) * kKislayDiscoveryPruneGraceMultiplier;
+            if (eligible_for_prune) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 static bool kislayphp_select_healthy_instance(php_kislayphp_discovery_t *obj,
@@ -1048,9 +1078,11 @@ static bool kislayphp_discovery_redis_sync_service(php_kislayphp_discovery_t *ob
 static bool kislayphp_discovery_redis_sync_all_services(php_kislayphp_discovery_t *obj,
                                                         std::string *error_out);
 static void kislayphp_discovery_warn_redis_fallback(const std::string &error);
+static std::string kislayphp_discovery_redis_ttl_seconds(php_kislayphp_discovery_t *obj);
 #else
 static std::string kislayphp_discovery_redis_services_key(php_kislayphp_discovery_t *) { return ""; }
 static std::string kislayphp_discovery_redis_instances_key(php_kislayphp_discovery_t *, const std::string &) { return ""; }
+static std::string kislayphp_discovery_redis_ttl_seconds(php_kislayphp_discovery_t *) { return "0"; }
 static bool kislayphp_discovery_instance_to_json(const php_kislayphp_discovery_t::ServiceInstance &, std::string *, std::string *) { return false; }
 static bool kislayphp_discovery_redis_hget(php_kislayphp_discovery_t *, const std::string &, const std::string &, std::string *, bool *, std::string *) { return false; }
 static bool kislayphp_discovery_redis_hlen(php_kislayphp_discovery_t *, const std::string &, long long *, std::string *) { return false; }
@@ -1120,10 +1152,22 @@ static bool kislayphp_discovery_register_local(
     if (obj->redis_enabled) {
         std::string redis_error;
         std::string payload_json;
+        const std::string instances_key = kislayphp_discovery_redis_instances_key(obj, service);
+        const std::string services_key = kislayphp_discovery_redis_services_key(obj);
         if (!kislayphp_discovery_instance_to_json(record, &payload_json, &redis_error)
-            || !kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_instances_key(obj, service), instance, payload_json}, &redis_error)
-            || !kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_services_key(obj), service, service_url}, &redis_error)) {
+            || !kislayphp_discovery_redis_simple_write(obj, {"HSET", instances_key, instance, payload_json}, &redis_error)
+            || !kislayphp_discovery_redis_simple_write(obj, {"HSET", services_key, service, service_url}, &redis_error)) {
             kislayphp_discovery_warn_redis_fallback(redis_error);
+        } else {
+            // No EXPIRE/PEXPIRE/SETEX previously existed anywhere on this
+            // write path, so a crashed instance that never calls
+            // deregister() would sit in Redis forever. Give both keys a TTL
+            // that heartbeat() refreshes (see kislayphp_discovery_heartbeat_
+            // local()) so an instance that stops heartbeating self-expires
+            // out of Redis instead of accumulating indefinitely.
+            const std::string ttl_seconds = kislayphp_discovery_redis_ttl_seconds(obj);
+            (void)kislayphp_discovery_redis_simple_write(obj, {"EXPIRE", instances_key, ttl_seconds}, nullptr);
+            (void)kislayphp_discovery_redis_simple_write(obj, {"EXPIRE", services_key, ttl_seconds}, nullptr);
         }
     }
     return true;
@@ -1219,6 +1263,30 @@ static void kislayphp_discovery_list_local(php_kislayphp_discovery_t *obj, zval 
     }
 }
 
+// Selects a resolved URL for `service` from obj->instances/obj->services.
+// Must be called with at least a read lock held (does not itself mutate
+// state - safe to call under either pthread_rwlock_rdlock or wrlock).
+static bool kislayphp_discovery_select_resolved_locked(php_kislayphp_discovery_t *obj,
+                                                       const std::string &service,
+                                                       const std::string &hash_key,
+                                                       std::string *value_out) {
+    php_kislayphp_discovery_t::ServiceInstance selected;
+    auto service_instances_it = obj->instances.find(service);
+    if (service_instances_it != obj->instances.end() && !service_instances_it->second.empty()) {
+        if (kislayphp_select_healthy_instance(obj, service, hash_key, &selected)) {
+            *value_out = selected.url;
+            return true;
+        }
+        return false;
+    }
+    auto it = obj->services.find(service);
+    if (it != obj->services.end()) {
+        *value_out = it->second;
+        return true;
+    }
+    return false;
+}
+
 static bool kislayphp_discovery_resolve_local(php_kislayphp_discovery_t *obj,
                                               const std::string &service,
                                               const std::string &hash_key,
@@ -1234,23 +1302,31 @@ static bool kislayphp_discovery_resolve_local(php_kislayphp_discovery_t *obj,
         }
     }
 
-    pthread_rwlock_wrlock(&obj->lock);
-    kislayphp_discovery_prune_stale_locked(obj, &service, &stale_instances);
-    php_kislayphp_discovery_t::ServiceInstance selected;
-    auto service_instances_it = obj->instances.find(service);
-    if (service_instances_it != obj->instances.end() && !service_instances_it->second.empty()) {
-        if (kislayphp_select_healthy_instance(obj, service, hash_key, &selected)) {
-            value = selected.url;
-            found = true;
-        }
-    } else {
-        auto it = obj->services.find(service);
-        if (it != obj->services.end()) {
-            value = it->second;
-            found = true;
-        }
+    // Fast path: resolve() is conceptually a pure read, so try it under a
+    // read lock first - readers don't block each other, only the rare
+    // pruning path below needs exclusive access. If nothing is stale, the
+    // whole call completes on the read lock.
+    pthread_rwlock_rdlock(&obj->lock);
+    bool needs_prune = kislayphp_discovery_has_stale_locked(obj, &service);
+    if (!needs_prune) {
+        found = kislayphp_discovery_select_resolved_locked(obj, service, hash_key, &value);
     }
-    pthread_rwlock_unlock_wr(&obj->lock);
+    pthread_rwlock_unlock_rd(&obj->lock);
+
+    if (needs_prune) {
+        // Escalate to the write lock only to prune. There's a TOCTOU window
+        // between releasing the read lock above and acquiring the write lock
+        // here - another thread could have already pruned (or refreshed via
+        // a concurrent heartbeat) the very instance that looked stale a
+        // moment ago. prune_stale_locked() re-evaluates staleness itself
+        // (it doesn't trust our earlier read), so it's safe to call
+        // unconditionally here rather than re-checking has_stale_locked()
+        // first.
+        pthread_rwlock_wrlock(&obj->lock);
+        kislayphp_discovery_prune_stale_locked(obj, &service, &stale_instances);
+        found = kislayphp_discovery_select_resolved_locked(obj, service, hash_key, &value);
+        pthread_rwlock_unlock_wr(&obj->lock);
+    }
 
     for (const auto &stale : stale_instances) {
         kislayphp_discovery_emit(obj, "discovery.heartbeat.timeout", stale.first, stale.second);
@@ -1331,6 +1407,21 @@ static bool kislayphp_discovery_heartbeat_local(php_kislayphp_discovery_t *obj,
                                                 const std::string &service,
                                                 const std::string &instance_id) {
     bool updated = false;
+    // Snapshot copies of the instances this heartbeat touched, taken while
+    // still holding the write lock below, so the Redis push afterwards
+    // doesn't need to re-acquire any lock at all - it only reads these local
+    // copies. Previously this function re-acquired obj->lock a second time
+    // and held it across kislayphp_discovery_redis_simple_write(), which
+    // opens a fresh TCP connection per call (see kislayphp_discovery_redis_
+    // command()) - a slow or hung Redis meant every other thread doing a
+    // local read/resolve blocked behind this same lock for the entire
+    // network round trip. Doing the Redis call after releasing the lock
+    // trades strict local/Redis consistency for eventual consistency (a
+    // reader could briefly see the old Redis-side state after the local
+    // state has already advanced) - that's the accepted, standard tradeoff;
+    // the alternative of holding a lock across network I/O is worse.
+    std::vector<std::pair<std::string, php_kislayphp_discovery_t::ServiceInstance>> touched_instances;
+
     pthread_rwlock_wrlock(&obj->lock);
     auto service_it = obj->instances.find(service);
     if (service_it != obj->instances.end() && !service_it->second.empty()) {
@@ -1340,37 +1431,44 @@ static bool kislayphp_discovery_heartbeat_local(php_kislayphp_discovery_t *obj,
                 inst_it->second.last_heartbeat_ms = kislayphp_now_ms();
                 inst_it->second.status = "UP";
                 updated = true;
+                if (obj->redis_enabled) {
+                    touched_instances.push_back({inst_it->first, inst_it->second});
+                }
             }
         } else {
             for (auto &inst_it : service_it->second) {
                 inst_it.second.last_heartbeat_ms = kislayphp_now_ms();
                 inst_it.second.status = "UP";
+                if (obj->redis_enabled) {
+                    touched_instances.push_back({inst_it.first, inst_it.second});
+                }
             }
             updated = true;
         }
     }
     pthread_rwlock_unlock_wr(&obj->lock);
 
-    if (updated && obj->redis_enabled) {
+    if (updated && obj->redis_enabled && !touched_instances.empty()) {
         std::string redis_error;
-        pthread_rwlock_wrlock(&obj->lock);
-        auto service_it = obj->instances.find(service);
-        if (service_it != obj->instances.end()) {
-            for (const auto &inst_it : service_it->second) {
-                if (!instance_id.empty() && inst_it.first != instance_id) {
-                    continue;
-                }
-                std::string payload_json;
-                if (kislayphp_discovery_instance_to_json(inst_it.second, &payload_json, &redis_error)
-                    && kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_instances_key(obj, service), inst_it.first, payload_json}, &redis_error)
-                    && kislayphp_discovery_redis_simple_write(obj, {"HSET", kislayphp_discovery_redis_services_key(obj), service, inst_it.second.url}, &redis_error)) {
-                    continue;
-                }
-                kislayphp_discovery_warn_redis_fallback(redis_error);
-                break;
+        const std::string instances_key = kislayphp_discovery_redis_instances_key(obj, service);
+        const std::string services_key = kislayphp_discovery_redis_services_key(obj);
+        const std::string ttl_seconds = kislayphp_discovery_redis_ttl_seconds(obj);
+        for (const auto &touched : touched_instances) {
+            std::string payload_json;
+            if (kislayphp_discovery_instance_to_json(touched.second, &payload_json, &redis_error)
+                && kislayphp_discovery_redis_simple_write(obj, {"HSET", instances_key, touched.first, payload_json}, &redis_error)
+                && kislayphp_discovery_redis_simple_write(obj, {"HSET", services_key, service, touched.second.url}, &redis_error)) {
+                // Refresh the TTL on every heartbeat so a live instance's
+                // Redis keys never expire out from under it, while a
+                // crashed one (no more heartbeats) ages out - see
+                // kislayphp_discovery_redis_ttl_seconds().
+                (void)kislayphp_discovery_redis_simple_write(obj, {"EXPIRE", instances_key, ttl_seconds}, nullptr);
+                (void)kislayphp_discovery_redis_simple_write(obj, {"EXPIRE", services_key, ttl_seconds}, nullptr);
+                continue;
             }
+            kislayphp_discovery_warn_redis_fallback(redis_error);
+            break;
         }
-        pthread_rwlock_unlock_wr(&obj->lock);
     }
     return updated;
 }
@@ -1713,18 +1811,98 @@ static bool kislayphp_discovery_redis_connect(php_kislayphp_discovery_t *obj, in
     return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Redis connection pool - keep one persistent connection open per thread per
+// (host, port, db, password) instead of paying a fresh DNS lookup + TCP
+// handshake + AUTH + SELECT on every single Redis command (was previously
+// kislayphp_discovery_redis_command() calling kislayphp_discovery_redis_
+// connect() and closing the fd again on every call). Mirrors KislayHttpPool
+// in kislayphp_queue.cpp: thread_local avoids any locking, since each
+// worker/server thread just owns its own fd(s). Different php_kislayphp_
+// discovery_t objects in the same thread that happen to point at the same
+// Redis endpoint transparently share a connection via the key; objects
+// pointed at different endpoints get separate ones.
+// ─────────────────────────────────────────────────────────────────────────
+static std::string kislayphp_discovery_redis_pool_key(php_kislayphp_discovery_t *obj) {
+    return obj->redis_host + ":" + std::to_string(obj->redis_port) + ":"
+        + std::to_string(obj->redis_db) + ":" + obj->redis_password;
+}
+
+class KislayDiscoveryRedisPool {
+public:
+    static KislayDiscoveryRedisPool &get() {
+        static thread_local KislayDiscoveryRedisPool instance;
+        return instance;
+    }
+
+    ~KislayDiscoveryRedisPool() { clear(); }
+
+    // Returns a live fd for obj's connection key, reusing a cached
+    // connection when possible and transparently reconnecting when there is
+    // none cached or the cached one has gone dead.
+    int acquire(php_kislayphp_discovery_t *obj, std::string *error_out) {
+        const std::string key = kislayphp_discovery_redis_pool_key(obj);
+        auto it = conns_.find(key);
+        if (it != conns_.end()) {
+            int fd = it->second;
+            // Liveness check: a dropped/closed peer shows up readable with 0
+            // bytes (orderly close) or a hard error; a live idle connection
+            // has nothing to read and returns EAGAIN/EWOULDBLOCK.
+            char buf;
+            ssize_t r = recv(fd, &buf, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                kislayphp_socket_close(fd);
+                conns_.erase(it);
+            } else {
+                return fd;
+            }
+        }
+
+        int fd = -1;
+        if (!kislayphp_discovery_redis_connect(obj, &fd, error_out)) {
+            return -1;
+        }
+        conns_[key] = fd;
+        return fd;
+    }
+
+    // Drop a connection that just failed mid-command (send/recv error, or a
+    // reply that doesn't parse) so the next acquire() reconnects instead of
+    // reusing a socket that may be out of sync with the RESP framing.
+    void discard(php_kislayphp_discovery_t *obj) {
+        const std::string key = kislayphp_discovery_redis_pool_key(obj);
+        auto it = conns_.find(key);
+        if (it != conns_.end()) {
+            kislayphp_socket_close(it->second);
+            conns_.erase(it);
+        }
+    }
+
+    void clear() {
+        for (auto &kv : conns_) {
+            kislayphp_socket_close(kv.second);
+        }
+        conns_.clear();
+    }
+
+private:
+    std::unordered_map<std::string, int> conns_;
+};
+
 static bool kislayphp_discovery_redis_command(php_kislayphp_discovery_t *obj,
                                               const std::vector<std::string> &parts,
                                               kislayphp_redis_reply_t *reply,
                                               std::string *error_out = nullptr) {
-    int fd = -1;
-    if (!kislayphp_discovery_redis_connect(obj, &fd, error_out)) {
+    int fd = KislayDiscoveryRedisPool::get().acquire(obj, error_out);
+    if (fd < 0) {
         return false;
     }
     std::string command = kislayphp_redis_encode_command(parts);
     bool ok = kislayphp_socket_send_all(fd, command, error_out)
         && kislayphp_redis_read_reply(fd, reply, error_out);
-    kislayphp_socket_close(fd);
+    if (!ok) {
+        KislayDiscoveryRedisPool::get().discard(obj);
+    }
     return ok;
 }
 
@@ -1734,6 +1912,24 @@ static std::string kislayphp_discovery_redis_services_key(php_kislayphp_discover
 
 static std::string kislayphp_discovery_redis_instances_key(php_kislayphp_discovery_t *obj, const std::string &service) {
     return obj->redis_prefix + ":instances:" + service;
+}
+
+// TTL (in seconds) applied via EXPIRE to Redis registration keys after every
+// write (register + heartbeat refresh), so a crashed/killed instance that
+// never explicitly deregisters self-expires out of Redis instead of
+// accumulating there forever (previously there was no EXPIRE/PEXPIRE/SETEX
+// anywhere in this file - a Redis-backed registry only ever grew). Mirrors
+// kKislayDiscoveryPruneGraceMultiplier, the same grace window the in-process
+// registry gives an instance before kislayphp_discovery_prune_stale_locked()
+// erases it, so a Redis-tracked instance expires out of Redis at roughly the
+// same time it would be pruned from the local in-memory registry.
+static std::string kislayphp_discovery_redis_ttl_seconds(php_kislayphp_discovery_t *obj) {
+    long long ttl_ms = static_cast<long long>(obj->heartbeat_timeout_ms) * kKislayDiscoveryPruneGraceMultiplier;
+    long long ttl_s = (ttl_ms + 999) / 1000;
+    if (ttl_s < 1) {
+        ttl_s = 1;
+    }
+    return std::to_string(ttl_s);
 }
 
 static bool kislayphp_discovery_instance_to_json(const php_kislayphp_discovery_t::ServiceInstance &instance,
@@ -2463,6 +2659,37 @@ static bool kislayphp_discovery_server_handle_request(php_kislayphp_discovery_t 
 }
 
 #ifndef _WIN32
+// kislayphp_discovery_server_run()'s accept loop below spawns a detached
+// std::thread per accepted connection instead of handling clients one at a
+// time (mirrors kislayphp_queue's Server::run() - see kislay_queue_php_call_
+// lock in kislayphp_queue.cpp for the original writeup of this hazard).
+//
+// Unlike queue, in discovery almost every request handler branch can touch
+// the Zend engine, and not only in the "build a zval response" tail of
+// kislayphp_discovery_server_handle_request(): kislayphp_discovery_instance_
+// to_json()/_from_json() round-trip every Redis-backed instance record
+// through PHP's json_encode()/json_decode() via a zval and call_user_
+// function(), so the Zend engine is touched from inside the Redis-backed
+// register()/resolve()/heartbeat()/list() code paths too - and register(),
+// deregister(), and setStatus() also call back into a PHP EventBus object
+// via kislayphp_discovery_emit(). On an NTS build (the default, and what
+// `php -v` on this checkout reports) there is a single Zend executor/
+// allocator with no per-thread isolation, so two connection threads
+// touching any of that concurrently is the same zend_mm heap corruption
+// class already found and fixed in kislayphp/socket and kislayphp/queue.
+//
+// Because those Zend touches are reachable deep inside the per-request
+// helpers (not confined to one easily-isolated tail of the handler), there
+// is no clean way to lock only "the Zend part" without a larger refactor to
+// strip zval usage out of the Redis JSON codec. So, like queue, the whole
+// handler body is serialized behind one recursive_mutex. That still fixes
+// the actual reported bug: accept() and each client's (potentially slow)
+// socket read no longer block behind another client's handling - only the
+// handling itself is serialized, and that's bounded by redis_timeout_ms
+// (200ms default) per Redis call on the redis-backed path, and effectively
+// free (in-process map work only) on the default in-memory backend.
+static std::recursive_mutex kislayphp_discovery_php_call_lock;
+
 static bool kislayphp_discovery_server_run(php_kislayphp_discovery_t *obj,
                                            std::string *error_out = nullptr) {
     struct addrinfo hints;
@@ -2520,27 +2747,40 @@ static bool kislayphp_discovery_server_run(php_kislayphp_discovery_t *obj,
             break;
         }
 
-        kislayphp_http_request_t request;
-        kislayphp_http_response_t response;
-        std::string request_error;
-        if (!kislayphp_http_read_request(client_fd, &request, &request_error)) {
-            kislayphp_http_send_response(client_fd, 400, "application/json",
-                "{\"error\":\"bad request\"}", nullptr);
-            kislayphp_socket_close(client_fd);
-            continue;
-        }
+        // Was previously handled inline right here - accept()/read/handle/
+        // close all on this one loop, so one slow or stalled client
+        // serialized every other client behind it. See kislayphp_discovery_
+        // php_call_lock above for why the handler body is still serialized
+        // (just no longer coupled to accept() or to reading the request off
+        // the wire).
+        std::thread([obj, client_fd]() {
+            kislayphp_http_request_t request;
+            std::string request_error;
+            if (!kislayphp_http_read_request(client_fd, &request, &request_error)) {
+                kislayphp_http_send_response(client_fd, 400, "application/json",
+                    "{\"error\":\"bad request\"}", nullptr);
+                kislayphp_socket_close(client_fd);
+                return;
+            }
 
-        std::string handler_error;
-        if (!kislayphp_discovery_server_handle_request(obj, request, &response, &handler_error)) {
-            kislayphp_http_send_response(client_fd, 500, "application/json",
-                "{\"error\":\"internal error\"}", nullptr);
-            kislayphp_socket_close(client_fd);
-            continue;
-        }
+            kislayphp_http_response_t response;
+            std::string handler_error;
+            bool handled = false;
+            {
+                std::lock_guard<std::recursive_mutex> php_guard(kislayphp_discovery_php_call_lock);
+                handled = kislayphp_discovery_server_handle_request(obj, request, &response, &handler_error);
+            }
+            if (!handled) {
+                kislayphp_http_send_response(client_fd, 500, "application/json",
+                    "{\"error\":\"internal error\"}", nullptr);
+                kislayphp_socket_close(client_fd);
+                return;
+            }
 
-        kislayphp_http_send_response(client_fd, response.status,
-            response.content_type, response.body, nullptr);
-        kislayphp_socket_close(client_fd);
+            kislayphp_http_send_response(client_fd, response.status,
+                response.content_type, response.body, nullptr);
+            kislayphp_socket_close(client_fd);
+        }).detach();
     }
 
     return true;
