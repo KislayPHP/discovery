@@ -4,12 +4,13 @@
 
 [![PHP Version](https://img.shields.io/badge/PHP-8.2+-blue.svg)](https://php.net)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
+[![Release](https://img.shields.io/badge/Release-1.0.1-orange.svg)]()
 
 ## Installation
 
 **Via PIE (recommended):**
 ```bash
-pie install kislayphp/discovery:0.0.7
+pie install kislayphp/discovery:1.0.1
 ```
 
 Add to `php.ini`:
@@ -88,6 +89,7 @@ When Redis is configured:
 |----------|---------|-------------|
 | `KISLAY_DISCOVERY_HEARTBEAT_TIMEOUT_MS` | `90000` | Max heartbeat age before stale |
 | `KISLAY_DISCOVERY_MAX_INSTANCES_PER_SERVICE` | `1024` | Per-service registration cap |
+| `KISLAY_DISCOVERY_SERVER_IO_TIMEOUT_MS` | `15000` | Standalone server's per-connection read/write deadline (`SO_RCVTIMEO`/`SO_SNDTIMEO`) — bounds how long a slow/idle client can hold a connection thread |
 | `KISLAY_DISCOVERY_STORAGE` | `memory` | `memory` or `redis` |
 | `KISLAY_DISCOVERY_REDIS_HOST` | `127.0.0.1` | Redis host |
 | `KISLAY_DISCOVERY_REDIS_PORT` | `6379` | Redis port |
