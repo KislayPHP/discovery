@@ -633,6 +633,11 @@ typedef struct _php_kislayphp_discovery_t {
     zend_long listen_port;
     bool has_remote_base_url;
     bool has_listen_config;
+    // Read/write deadline applied to each accepted client_fd in
+    // kislayphp_discovery_server_run() - see that function's accept loop
+    // for why this exists (a client that connects and sends nothing, or
+    // trickles bytes, would otherwise park a detached thread+fd forever).
+    zend_long server_io_timeout_ms;
     zend_object std;
 } php_kislayphp_discovery_t;
 
@@ -669,6 +674,10 @@ static zend_object *kislayphp_discovery_create_object(zend_class_entry *ce) {
     }
     new (&obj->redis_password) std::string(kislayphp_env_string("KISLAY_DISCOVERY_REDIS_PASSWORD", ""));
     new (&obj->redis_prefix) std::string(kislayphp_env_string("KISLAY_DISCOVERY_REDIS_PREFIX", "kislay:discovery"));
+    obj->server_io_timeout_ms = kislayphp_env_long("KISLAY_DISCOVERY_SERVER_IO_TIMEOUT_MS", 15000);
+    if (obj->server_io_timeout_ms < 1) {
+        obj->server_io_timeout_ms = 15000;
+    }
     pthread_rwlock_init(&obj->lock, nullptr);
     ZVAL_UNDEF(&obj->bus);
     obj->has_bus = false;
@@ -2690,6 +2699,24 @@ static bool kislayphp_discovery_server_handle_request(php_kislayphp_discovery_t 
 // free (in-process map work only) on the default in-memory backend.
 static std::recursive_mutex kislayphp_discovery_php_call_lock;
 
+// Bounds how many detached connection-handler threads can be in flight at
+// once, and (via server_io_timeout_ms applied to each client_fd below)
+// bounds how long any single one of them can stay alive - without both, a
+// client that connects and sends nothing (or trickles bytes) parks a
+// thread+fd forever, and enough such clients exhaust the process. Mirrors
+// kislay_queue's KISLAY_QUEUE_MAX_CONNECTIONS/socket_timeout_ms, applied
+// here to fix the identical gap: this accept loop's own comment already
+// noted it "mirrors kislayphp_queue's Server::run()" but had not yet
+// carried over queue's timeout/cap half of that fix.
+static std::atomic<int> kislayphp_discovery_active_connections{0};
+static constexpr int KISLAYPHP_DISCOVERY_MAX_CONNECTIONS = 512;
+
+struct kislayphp_discovery_connection_guard_t {
+    ~kislayphp_discovery_connection_guard_t() {
+        kislayphp_discovery_active_connections.fetch_sub(1, std::memory_order_relaxed);
+    }
+};
+
 static bool kislayphp_discovery_server_run(php_kislayphp_discovery_t *obj,
                                            std::string *error_out = nullptr) {
     struct addrinfo hints;
@@ -2747,6 +2774,24 @@ static bool kislayphp_discovery_server_run(php_kislayphp_discovery_t *obj,
             break;
         }
 
+        // Reject immediately rather than spawning an unbounded number of
+        // detached threads once too many connections are already being
+        // handled - see kislayphp_discovery_active_connections' comment.
+        if (kislayphp_discovery_active_connections.load(std::memory_order_relaxed) >= KISLAYPHP_DISCOVERY_MAX_CONNECTIONS) {
+            kislayphp_http_send_response(client_fd, 503, "application/json", "{\"error\":\"server busy\"}", nullptr);
+            kislayphp_socket_close(client_fd);
+            continue;
+        }
+
+        // Read/write deadline for this connection: without this a client
+        // that connects and sends nothing (or trickles bytes) parks this
+        // thread+fd forever - recv()/send() now fail past the deadline,
+        // which kislayphp_http_read_request() already treats as a hard
+        // failure (any n <= 0 from recv()).
+        kislayphp_socket_set_timeout(client_fd, obj->server_io_timeout_ms);
+
+        kislayphp_discovery_active_connections.fetch_add(1, std::memory_order_relaxed);
+
         // Was previously handled inline right here - accept()/read/handle/
         // close all on this one loop, so one slow or stalled client
         // serialized every other client behind it. See kislayphp_discovery_
@@ -2754,6 +2799,7 @@ static bool kislayphp_discovery_server_run(php_kislayphp_discovery_t *obj,
         // (just no longer coupled to accept() or to reading the request off
         // the wire).
         std::thread([obj, client_fd]() {
+            kislayphp_discovery_connection_guard_t conn_guard;
             kislayphp_http_request_t request;
             std::string request_error;
             if (!kislayphp_http_read_request(client_fd, &request, &request_error)) {
